@@ -777,8 +777,8 @@ export class ResponseMonitor {
                 this.baselineCardCount = bl.cardCount ?? 0;
             }
             logger.debug(`[ResponseMonitor] Artifact baseline: ${this.baselineNotifyCount} notify, ${this.baselineCardCount} cards`);
-        } catch {
-            // Best-effort; baseline stays at 0 (conservative: may still detect old artifacts)
+        } catch (e) {
+            logger.debug('[ResponseMonitor] Artifact baseline failed (best-effort):', e);
         }
 
         // Capture baselines in parallel (text + process logs + optional structured)
@@ -822,8 +822,8 @@ export class ResponseMonitor {
                         if (key) this.seenThinkingLogKeys.add(key);
                     }
                 }
-            } catch {
-                // structured baseline is best-effort
+            } catch (e) {
+                logger.debug('[ResponseMonitor] Structured baseline classification failed (best-effort):', e);
             }
         }
 
@@ -970,8 +970,8 @@ export class ResponseMonitor {
             this.seenProcessLogKeys.add(key);
             try {
                 this.onProcessLog?.(normalized.slice(0, 300));
-            } catch {
-                // callback error
+            } catch (e) {
+                logger.debug('[ResponseMonitor] onProcessLog callback error:', e);
             }
         }
     }
@@ -991,8 +991,8 @@ export class ResponseMonitor {
             logger.debug('[ResponseMonitor] Emitting thinking entry:', normalized.slice(0, 80));
             try {
                 this.onThinkingLog?.(normalized.slice(0, 2000));
-            } catch {
-                // callback error
+            } catch (e) {
+                logger.debug('[ResponseMonitor] onThinkingLog callback error:', e);
             }
         }
     }
@@ -1174,7 +1174,7 @@ export class ResponseMonitor {
                     await this.stop();
                     try {
                         await Promise.resolve(this.onTimeout?.(lastText));
-                    } catch { /* callback error */ }
+                    } catch (e) { logger.debug('[ResponseMonitor] onTimeout callback error:', e); }
                 }
                 return;
             }

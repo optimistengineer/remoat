@@ -72,7 +72,7 @@ export async function getCurrentChatTitle(cdp: CdpService): Promise<string | nul
             if (typeof value === 'string' && value.trim().length > 0) {
                 return value.trim();
             }
-        } catch { /* continue */ }
+        } catch (e) { logger.debug('[CdpBridgeManager] Title probe failed, continuing:', e); }
     }
     return null;
 }

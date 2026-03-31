@@ -37,6 +37,8 @@ export interface PromptDispatcherDeps {
         inboundImages?: InboundImageAttachment[],
         options?: PromptDispatchOptions,
     ) => Promise<void>;
+    /** Called when a prompt is queued behind an active one. Lets the user know their message is waiting. */
+    notifyQueued?: (channel: TelegramChannel, prompt: string) => void;
 }
 
 export class PromptDispatcher {
@@ -59,8 +61,12 @@ export class PromptDispatcher {
         // Serialize per workspace (primary) and per channel (fallback).
         // Two topics bound to the same workspace must not poll the DOM concurrently.
         const lockKey = wsKey ?? chKey;
-        const previous = this.workspaceLocks.get(lockKey) ?? Promise.resolve();
-        const current = previous.then(() =>
+        const previous = this.workspaceLocks.get(lockKey);
+        if (previous !== undefined) {
+            // Something is already running for this workspace/channel — notify the user.
+            this.deps.notifyQueued?.(req.channel, req.prompt);
+        }
+        const current = (previous ?? Promise.resolve()).then(() =>
             this.deps.sendPromptImpl(
                 this.deps.bridge,
                 req.channel,

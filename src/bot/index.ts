@@ -443,10 +443,17 @@ async function sendPromptToAntigravity(
             const res = await cdp.call('Runtime.evaluate', callParams);
             const value = res?.result?.value;
             return typeof value === 'string' ? value.trim() : '';
-        } catch { return ''; }
+        } catch (e) { logger.debug('[tryEmergencyExtractText] Failed:', e); return ''; }
     };
 
     let monitor: ResponseMonitor | null = null;
+
+    // Completion gate: holds the PromptDispatcher lock until onComplete/onTimeout fires.
+    // Without this, monitor.start() resolves immediately (it schedules polling via setTimeout),
+    // causing the dispatcher to release the lock while Antigravity is still generating —
+    // allowing a second prompt to inject concurrently and produce duplicate responses.
+    let resolveMonitorDone!: () => void;
+    const monitorDone = new Promise<void>(resolve => { resolveMonitorDone = resolve; });
 
     try {
         // Reset PlanningDetector baseline BEFORE injecting the message.
@@ -582,6 +589,7 @@ async function sendPromptToAntigravity(
                 if (wasStoppedByUser) {
                     logger.info(`[sendPrompt:${monitorTraceId}] Stopped by user`);
                     await sendMsg('⏹️ Generation stopped.');
+                    resolveMonitorDone();
                     return;
                 }
 
@@ -602,6 +610,7 @@ async function sendPromptToAntigravity(
                                 await api.sendMessage(channel.chatId, payload.text, { parse_mode: 'HTML', message_thread_id: channel.threadId, reply_markup: payload.keyboard });
                             }
                         } catch (e) { logger.error('[Quota] Failed to send model selection UI:', e); }
+                        resolveMonitorDone();
                         return;
                     }
 
@@ -753,7 +762,7 @@ async function sendPromptToAntigravity(
                                         try {
                                             options.topicManager.setChatId(Number(session.channelId.split(':')[0]));
                                             await options.topicManager.renameTopic(threadId, formattedName);
-                                        } catch { /* topic rename optional */ }
+                                        } catch (e) { logger.debug('[Rename] Topic rename optional, failed:', e); }
                                     }
                                     options.chatSessionRepo.updateDisplayName(channelKey(channel), sessionInfo.title);
                                 }
@@ -763,6 +772,7 @@ async function sendPromptToAntigravity(
 
                     await sendGeneratedImages(finalOutputText || '');
                 } catch (error) { logger.error(`[sendPrompt:${monitorTraceId}] onComplete failed:`, error); }
+                resolveMonitorDone();
             },
             onTimeout: async (lastText) => {
                 isFinalized = true;
@@ -783,6 +793,7 @@ async function sendPromptToAntigravity(
                     thinkingActive = false;
                     await setProgressMessage(`<b>${PHASE_ICONS.timeout} ${escapeHtml(modelLabel)} · ${elapsed}s</b>\n\n${buildProgressBody()}`, { expectedVersion: liveActivityUpdateVersion });
                 } catch (error) { logger.error(`[sendPrompt:${monitorTraceId}] onTimeout failed:`, error); }
+                resolveMonitorDone();
             },
         });
 
@@ -793,12 +804,19 @@ async function sendPromptToAntigravity(
             triggerProgressRefresh();
         }, 5000);
 
+        // Hold the PromptDispatcher lock until the monitor fires onComplete or onTimeout.
+        // This prevents a second incoming prompt from injecting while Antigravity is still generating.
+        await monitorDone;
+
     } catch (e: any) {
         isFinalized = true;
         userStopRequestedChannels.delete(channelKey(channel));
         if (elapsedTimer) { clearInterval(elapsedTimer); }
         if (monitor) { await monitor.stop().catch(() => {}); }
         await sendEmbed(`${PHASE_ICONS.error} Error`, t(`Error occurred during processing: ${e.message}`));
+        // Safety: resolve the gate so the dispatcher lock is released on early errors
+        // (e.g., if monitor.start() throws before onComplete/onTimeout ever fires).
+        resolveMonitorDone();
     }
 }
 
@@ -832,6 +850,15 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
         modeService,
         modelService,
         sendPromptImpl: sendPromptToAntigravity,
+        notifyQueued: (channel, prompt) => {
+            if (!bridge.botApi) return;
+            const preview = prompt.length > 80 ? prompt.slice(0, 80) + '…' : prompt;
+            bridge.botApi.sendMessage(
+                channel.chatId,
+                `⏳ <b>Message queued</b> — Antigravity is still working.\n\n<i>${escapeHtml(preview)}</i>\n\nYour message will be sent automatically when the current response completes.`,
+                { parse_mode: 'HTML', message_thread_id: channel.threadId },
+            ).catch(() => {});
+        },
     });
 
     const slashCommandHandler = new SlashCommandHandler(templateRepo);
@@ -1223,7 +1250,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             const { text, keyboard } = await buildModeUI(modeService, { getCurrentCdp: () => getCurrentCdp(bridge) });
             try {
                 await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard });
-            } catch { /* may fail if unchanged */ }
+            } catch (e) { logger.debug('[modeSelect] editMessageText failed (expected if unchanged):', e); }
             await ctx.answerCallbackQuery({ text: `Mode: ${MODE_DISPLAY_NAMES[selectedMode] || selectedMode}` });
             return;
         }
@@ -1243,7 +1270,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             const res = await cdp.setUiModel(modelName);
             if (res.ok) {
                 const payload = await buildModelsUI(cdp, () => bridge.quota.fetchQuota());
-                if (payload) try { await ctx.editMessageText(payload.text, { parse_mode: 'HTML', reply_markup: payload.keyboard }); } catch { }
+                if (payload) try { await ctx.editMessageText(payload.text, { parse_mode: 'HTML', reply_markup: payload.keyboard }); } catch (e) { logger.debug('[editMsg] Telegram edit failed (expected for unmodified):', e); }
                 await ctx.answerCallbackQuery({ text: `Model: ${res.model}` });
             } else {
                 await ctx.answerCallbackQuery({ text: res.error || 'Failed to change model.' });
@@ -1256,7 +1283,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             const cdp = getCurrentCdp(bridge);
             if (!cdp) { await ctx.answerCallbackQuery({ text: 'Not connected.' }); return; }
             const payload = await buildModelsUI(cdp, () => bridge.quota.fetchQuota());
-            if (payload) try { await ctx.editMessageText(payload.text, { parse_mode: 'HTML', reply_markup: payload.keyboard }); } catch { }
+            if (payload) try { await ctx.editMessageText(payload.text, { parse_mode: 'HTML', reply_markup: payload.keyboard }); } catch (e) { logger.debug('[editMsg] Telegram edit failed (expected for unmodified):', e); }
             await ctx.answerCallbackQuery({ text: 'Refreshed' });
             return;
         }
@@ -1266,7 +1293,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             const action = data === AUTOACCEPT_BTN_ON ? 'on' : 'off';
             bridge.autoAccept.handle(action);
             await sendAutoAcceptUI(
-                async (text, keyboard) => { try { await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard }); } catch { } },
+                async (text, keyboard) => { try { await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard }); } catch (e) { logger.debug('[editMsg] Telegram edit failed (expected for unmodified):', e); } },
                 bridge.autoAccept,
             );
             await ctx.answerCallbackQuery({ text: `Auto-accept: ${action.toUpperCase()}` });
@@ -1275,7 +1302,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
 
         if (data === AUTOACCEPT_BTN_REFRESH) {
             await sendAutoAcceptUI(
-                async (text, keyboard) => { try { await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard }); } catch { } },
+                async (text, keyboard) => { try { await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard }); } catch (e) { logger.debug('[editMsg] Telegram edit failed (expected for unmodified):', e); } },
                 bridge.autoAccept,
             );
             await ctx.answerCallbackQuery({ text: 'Refreshed' });
@@ -1346,7 +1373,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             if (!isNaN(page)) {
                 const workspaces = workspaceService.scanWorkspaces();
                 const { text, keyboard } = buildProjectListUI(workspaces, page);
-                try { await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard }); } catch { }
+                try { await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard }); } catch (e) { logger.debug('[editMsg] Telegram edit failed (expected for unmodified):', e); }
             }
             await ctx.answerCallbackQuery();
             return;
@@ -1406,7 +1433,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             else { success = await detector.denyButton(); actionLabel = 'Deny'; }
 
             if (success) {
-                try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch { }
+                try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch (e) { logger.debug('[editMsg] Telegram edit failed (expected for unmodified):', e); }
                 await ctx.answerCallbackQuery({ text: `${actionLabel} executed.` });
             } else {
                 await ctx.answerCallbackQuery({ text: 'Button not found.' });
@@ -1444,7 +1471,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
                 await ctx.answerCallbackQuery({ text: clicked ? 'Opened' : 'Open button not found.' });
             } else {
                 const clicked = await detector.clickProceedButton();
-                if (clicked) try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch { }
+                if (clicked) try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch (e) { logger.debug('[editMsg] Telegram edit failed (expected for unmodified):', e); }
                 await ctx.answerCallbackQuery({ text: clicked ? 'Proceeding...' : 'Proceed button not found.' });
             }
             return;
@@ -1491,7 +1518,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             const clicked = await detector.clickProceedButton();
             if (clicked) {
                 planEditPendingChannels.delete(channelKey(ch));
-                try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch { }
+                try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch (e) { logger.debug('[editMsg] Telegram edit failed (expected for unmodified):', e); }
             }
             await ctx.answerCallbackQuery({ text: clicked ? 'Proceeding...' : 'Proceed button not found.' });
             return;
@@ -1515,7 +1542,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             const info = detector.getLastDetectedInfo();
             if (info) {
                 const { text: uiText, keyboard: uiKeyboard } = buildPlanNotificationUI(info, projectName, targetChannelStr || String(ch.chatId));
-                try { await ctx.editMessageText(uiText, { parse_mode: 'HTML', reply_markup: uiKeyboard }); } catch { }
+                try { await ctx.editMessageText(uiText, { parse_mode: 'HTML', reply_markup: uiKeyboard }); } catch (e) { logger.debug('[editMsg] Telegram edit failed (expected for unmodified):', e); }
             }
             await ctx.answerCallbackQuery({ text: 'Refreshed' });
             return;
@@ -1536,7 +1563,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             const lastInfo = detector?.getLastDetectedInfo();
 
             const { text: pageText, keyboard: pageKeyboard } = buildPlanContentUI(pages, page, projectName, targetChannelStr || String(ch.chatId), lastInfo?.planTitle ?? undefined, lastInfo?.proceedText ?? undefined);
-            try { await ctx.editMessageText(pageText, { parse_mode: 'HTML', reply_markup: pageKeyboard }); } catch { }
+            try { await ctx.editMessageText(pageText, { parse_mode: 'HTML', reply_markup: pageKeyboard }); } catch (e) { logger.debug('[editMsg] Telegram edit failed (expected for unmodified):', e); }
             await ctx.answerCallbackQuery({ text: `Page ${page + 1}/${pages.length}` });
             return;
         }
@@ -1550,7 +1577,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
 
             if (errorAction.action === 'dismiss') {
                 const clicked = await detector.clickDismissButton();
-                if (clicked) try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch { }
+                if (clicked) try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch (e) { logger.debug('[editMsg] Telegram edit failed (expected for unmodified):', e); }
                 await ctx.answerCallbackQuery({ text: clicked ? 'Dismissed' : 'Button not found.' });
             } else if (errorAction.action === 'copy_debug') {
                 const clicked = await detector.clickCopyDebugInfoButton();
@@ -1568,7 +1595,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
                 await ctx.answerCallbackQuery({ text: feedbackText });
             } else {
                 const clicked = await detector.clickRetryButton();
-                if (clicked) try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch { }
+                if (clicked) try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch (e) { logger.debug('[editMsg] Telegram edit failed (expected for unmodified):', e); }
                 await ctx.answerCallbackQuery({ text: clicked ? 'Retrying...' : 'Button not found.' });
             }
             return;
@@ -1577,7 +1604,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
         // Cleanup buttons
         if (data.startsWith(CLEANUP_ARCHIVE_BTN) || data.startsWith(CLEANUP_DELETE_BTN) || data === CLEANUP_CANCEL_BTN) {
             if (data === CLEANUP_CANCEL_BTN) {
-                try { await ctx.editMessageText('Cleanup cancelled.'); } catch { }
+                try { await ctx.editMessageText('Cleanup cancelled.'); } catch (e) { logger.debug('[editMsg] Telegram edit failed (expected for unmodified):', e); }
                 await ctx.answerCallbackQuery({ text: 'Cancelled' });
                 return;
             }
@@ -1610,7 +1637,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             }
 
             const action = isDelete ? 'deleted' : 'archived';
-            try { await ctx.editMessageText(`✅ Cleanup complete — ${processed} session(s) ${action}.`); } catch { }
+            try { await ctx.editMessageText(`✅ Cleanup complete — ${processed} session(s) ${action}.`); } catch (e) { logger.debug('[editMsg] Telegram edit failed (expected for unmodified):', e); }
             await ctx.answerCallbackQuery({ text: `${processed} session(s) ${action}` });
             return;
         }
@@ -1726,7 +1753,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             }
         } else if (session && !session.isRenamed) {
             try { await chatSessionService.startNewChat(resolved.cdp); }
-            catch { /* continue anyway */ }
+            catch (e) { logger.debug('[startNewChat] Failed, continuing anyway:', e); }
         }
 
         const userMsgDetector = bridge.pool.getUserMessageDetector?.(resolved.projectName);
@@ -1844,7 +1871,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
     logger.info('Starting Remoat Telegram bot...');
 
     // Graceful shutdown: close database on exit
-    const closeDb = () => { try { db.close(); } catch { /* ignore */ } };
+    const closeDb = () => { try { db.close(); } catch (e) { logger.debug('[shutdown] db.close() failed:', e); } };
     process.on('exit', closeDb);
     process.on('SIGINT', () => { closeDb(); process.exit(0); });
     process.on('SIGTERM', () => { closeDb(); process.exit(0); });

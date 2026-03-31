@@ -53,8 +53,9 @@ export class CdpConnectionPool extends EventEmitter {
                     // Re-validate that the still-open window is actually bound to this workspace.
                     await existing.discoverAndConnectForWorkspace(workspacePath);
                     return existing;
-                } catch {
+                } catch (e) {
                     // Connection dropped during re-validation; close WebSocket and clean up
+                    logger.debug('[CdpConnectionPool] Re-validation failed, cleaning up connection:', e);
                     existing.disconnect().catch(() => {});
                     this.connections.delete(projectName);
                 }
