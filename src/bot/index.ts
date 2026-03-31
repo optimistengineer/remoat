@@ -43,7 +43,6 @@ import {
 import { classifyAssistantSegments, extractAssistantSegmentsPayloadScript } from '../services/assistantDomExtractor';
 import { buildModeModelLines, splitForEmbedDescription } from '../utils/streamMessageFormatter';
 import { formatForTelegram, splitOutputAndLogs, escapeHtml, splitTelegramHtml } from '../utils/telegramFormatter';
-// ProcessLogBuffer no longer used — progress display uses ordered event stream
 import {
     buildPromptWithAttachmentUrls,
     cleanupInboundImageAttachments,
@@ -64,6 +63,10 @@ import {
     PLAN_VIEW_BTN, PLAN_PROCEED_BTN, PLAN_EDIT_BTN, PLAN_REFRESH_BTN, PLAN_PAGE_PREFIX,
     buildPlanNotificationUI, buildPlanContentUI, paginatePlanContent,
 } from '../ui/planUi';
+import {
+    INTERRUPT_QUEUE_PREFIX, INTERRUPT_NOW_PREFIX, INTERRUPT_DISCARD_PREFIX,
+    buildInterruptUI,
+} from '../ui/queueUi';
 
 const PHASE_ICONS = {
     sending: '📡',
@@ -112,6 +115,17 @@ function stripHtmlForFile(html: string): string {
 }
 
 const userStopRequestedChannels = new Set<string>();
+
+/** Messages waiting for user to decide: Queue / Send Now / Discard */
+interface PendingInterrupt {
+    prompt: string;
+    channel: TelegramChannel;
+    cdp: CdpService;
+    inboundImages: InboundImageAttachment[];
+    options?: { chatSessionService: ChatSessionService; chatSessionRepo: ChatSessionRepository; topicManager: TelegramTopicManager; titleGenerator: TitleGeneratorService };
+    interruptMsgId?: number;
+}
+const pendingInterrupts = new Map<string, PendingInterrupt>();
 
 /** Channels where the user is expected to type plan edit instructions */
 const planEditPendingChannels = new Map<string, { projectName: string }>();
@@ -850,14 +864,26 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
         modeService,
         modelService,
         sendPromptImpl: sendPromptToAntigravity,
-        notifyQueued: (channel, prompt) => {
-            if (!bridge.botApi) return;
-            const preview = prompt.length > 80 ? prompt.slice(0, 80) + '…' : prompt;
-            bridge.botApi.sendMessage(
-                channel.chatId,
-                `⏳ <b>Message queued</b> — Antigravity is still working.\n\n<i>${escapeHtml(preview)}</i>\n\nYour message will be sent automatically when the current response completes.`,
-                { parse_mode: 'HTML', message_thread_id: channel.threadId },
-            ).catch((e) => { logger.debug('[notifyQueued] sendMessage failed:', e); });
+        onTaskComplete: (channel) => {
+            // Auto-queue fallback: if the user hasn't tapped Queue/Send Now/Discard yet,
+            // automatically dispatch the pending message now that the current task is done.
+            const chKey = channelKey(channel);
+            const pending = pendingInterrupts.get(chKey);
+            if (!pending) return;
+            pendingInterrupts.delete(chKey);
+            logger.info(`[autoQueue] Auto-dispatching pending interrupt for ${chKey}`);
+            // Edit the interrupt keyboard message to show it was auto-queued
+            if (pending.interruptMsgId && bridge.botApi) {
+                bridge.botApi.editMessageText(channel.chatId, pending.interruptMsgId, '📥 Task finished — sending your queued message…', { parse_mode: 'HTML' })
+                    .catch((e: any) => { logger.debug('[autoQueue] editMessage failed:', e); });
+            }
+            promptDispatcher.send({
+                channel: pending.channel,
+                prompt: pending.prompt,
+                cdp: pending.cdp,
+                inboundImages: pending.inboundImages,
+                options: pending.options,
+            }).catch((e: any) => { logger.error('[autoQueue] dispatch failed:', e); });
         },
     });
 
@@ -1601,6 +1627,70 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             return;
         }
 
+        // Interrupt buttons (Queue / Send Now / Discard)
+        if (data.startsWith(INTERRUPT_QUEUE_PREFIX) || data.startsWith(INTERRUPT_NOW_PREFIX) || data.startsWith(INTERRUPT_DISCARD_PREFIX)) {
+            const targetKey = data.startsWith(INTERRUPT_QUEUE_PREFIX)
+                ? data.slice(INTERRUPT_QUEUE_PREFIX.length)
+                : data.startsWith(INTERRUPT_NOW_PREFIX)
+                    ? data.slice(INTERRUPT_NOW_PREFIX.length)
+                    : data.slice(INTERRUPT_DISCARD_PREFIX.length);
+            const pending = pendingInterrupts.get(targetKey);
+
+            if (data.startsWith(INTERRUPT_DISCARD_PREFIX)) {
+                pendingInterrupts.delete(targetKey);
+                try { await ctx.editMessageText('🗑 Message discarded.'); } catch (e) { logger.debug('[editMsg] Telegram edit failed:', e); }
+                await ctx.answerCallbackQuery({ text: 'Discarded' });
+                return;
+            }
+
+            if (!pending) {
+                try { await ctx.editMessageText('✅ Task finished — your message was already processed.'); } catch (e) { logger.debug('[editMsg] Telegram edit failed:', e); }
+                await ctx.answerCallbackQuery({ text: 'Already processed' });
+                return;
+            }
+
+            pendingInterrupts.delete(targetKey);
+
+            if (data.startsWith(INTERRUPT_NOW_PREFIX)) {
+                // Stop current generation, then send the new prompt
+                try { await ctx.editMessageText('⚡ Stopping current task and sending your message…'); } catch (e) { logger.debug('[editMsg] Telegram edit failed:', e); }
+                await ctx.answerCallbackQuery({ text: 'Stopping & sending...' });
+
+                // Click the stop button in Antigravity
+                try {
+                    const contextId = pending.cdp.getPrimaryContextId();
+                    const callParams: Record<string, unknown> = { expression: RESPONSE_SELECTORS.CLICK_STOP_BUTTON, returnByValue: true, awaitPromise: false };
+                    if (contextId !== null) callParams.contextId = contextId;
+                    await pending.cdp.call('Runtime.evaluate', callParams);
+                    userStopRequestedChannels.add(channelKey(pending.channel));
+                } catch (e) { logger.debug('[interrupt:now] Stop button click failed:', e); }
+
+                // Dispatch — the promise chain will wait for the current task to finish
+                // (the stop button triggers onComplete with wasStoppedByUser, releasing the lock)
+                promptDispatcher.send({
+                    channel: pending.channel,
+                    prompt: pending.prompt,
+                    cdp: pending.cdp,
+                    inboundImages: pending.inboundImages,
+                    options: pending.options,
+                }).catch((e) => { logger.error('[interrupt:now] dispatch failed:', e); });
+                return;
+            }
+
+            // INTERRUPT_QUEUE_PREFIX — queue to run after current task finishes
+            try { await ctx.editMessageText('📥 Message queued — will send after current task.'); } catch (e) { logger.debug('[editMsg] Telegram edit failed:', e); }
+            await ctx.answerCallbackQuery({ text: 'Queued' });
+
+            promptDispatcher.send({
+                channel: pending.channel,
+                prompt: pending.prompt,
+                cdp: pending.cdp,
+                inboundImages: pending.inboundImages,
+                options: pending.options,
+            }).catch((e) => { logger.error('[interrupt:queue] dispatch failed:', e); });
+            return;
+        }
+
         // Cleanup buttons
         if (data.startsWith(CLEANUP_ARCHIVE_BTN) || data.startsWith(CLEANUP_DELETE_BTN) || data === CLEANUP_CANCEL_BTN) {
             if (data === CLEANUP_CANCEL_BTN) {
@@ -1737,6 +1827,26 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
         const resolved = await resolveWorkspaceAndCdp(ch);
         if (!resolved) {
             await ctx.reply('No project is configured for this chat. Use /project to select one.');
+            return;
+        }
+
+        // Busy check: if Antigravity is still generating, show interrupt keyboard
+        if (promptDispatcher.isBusy(ch, resolved.cdp)) {
+            const dispatchOptions = { chatSessionService, chatSessionRepo, topicManager, titleGenerator };
+            const { text: uiText, keyboard } = buildInterruptUI(key, text);
+            const sent = await bot.api.sendMessage(ch.chatId, uiText, {
+                parse_mode: 'HTML',
+                message_thread_id: ch.threadId,
+                reply_markup: keyboard,
+            });
+            pendingInterrupts.set(key, {
+                prompt: text,
+                channel: ch,
+                cdp: resolved.cdp,
+                inboundImages: [],
+                options: dispatchOptions,
+                interruptMsgId: sent.message_id,
+            });
             return;
         }
 

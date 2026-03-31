@@ -37,8 +37,8 @@ export interface PromptDispatcherDeps {
         inboundImages?: InboundImageAttachment[],
         options?: PromptDispatchOptions,
     ) => Promise<void>;
-    /** Called when a prompt is queued behind an active one. Lets the user know their message is waiting. */
-    notifyQueued?: (channel: TelegramChannel, prompt: string) => void;
+    /** Called after each task completes (success or error). Used for auto-queue fallback. */
+    onTaskComplete?: (channel: TelegramChannel) => void;
 }
 
 export class PromptDispatcher {
@@ -53,6 +53,15 @@ export class PromptDispatcher {
         return ch.threadId ? `${ch.chatId}:${ch.threadId}` : String(ch.chatId);
     }
 
+    /** Check whether a prompt is already in-flight for a given channel/workspace. */
+    isBusy(channel: TelegramChannel, cdp: CdpService): boolean {
+        const chKey = this.channelKey(channel);
+        const wsName = cdp.getCurrentWorkspaceName();
+        const wsKey = wsName ? `ws:${wsName}` : null;
+        const lockKey = wsKey ?? chKey;
+        return this.workspaceLocks.has(lockKey);
+    }
+
     async send(req: PromptDispatchRequest): Promise<void> {
         const chKey = this.channelKey(req.channel);
         const wsName = req.cdp.getCurrentWorkspaceName();
@@ -61,12 +70,8 @@ export class PromptDispatcher {
         // Serialize per workspace (primary) and per channel (fallback).
         // Two topics bound to the same workspace must not poll the DOM concurrently.
         const lockKey = wsKey ?? chKey;
-        const previous = this.workspaceLocks.get(lockKey);
-        if (previous !== undefined) {
-            // Something is already running for this workspace/channel — notify the user.
-            this.deps.notifyQueued?.(req.channel, req.prompt);
-        }
-        const current = (previous ?? Promise.resolve()).then(() =>
+        const previous = this.workspaceLocks.get(lockKey) ?? Promise.resolve();
+        const current = previous.then(() =>
             this.deps.sendPromptImpl(
                 this.deps.bridge,
                 req.channel,
@@ -92,6 +97,7 @@ export class PromptDispatcher {
             if (this.channelLocks.get(chKey) === current) {
                 this.channelLocks.delete(chKey);
             }
+            this.deps.onTaskComplete?.(req.channel);
         }
     }
 }
