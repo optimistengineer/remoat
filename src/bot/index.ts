@@ -129,16 +129,8 @@ function stripHtmlForFile(html: string): string {
 
 const userStopRequestedChannels = new Set<string>();
 
-/** Messages waiting for user to decide: Queue / Send Now / Discard */
-interface PendingInterrupt {
-    prompt: string;
-    channel: TelegramChannel;
-    cdp: CdpService;
-    inboundImages: InboundImageAttachment[];
-    options?: { chatSessionService: ChatSessionService; chatSessionRepo: ChatSessionRepository; topicManager: TelegramTopicManager; titleGenerator: TitleGeneratorService };
-    interruptMsgId?: number;
-}
-const pendingInterrupts = new Map<string, PendingInterrupt>();
+// Interrupt state is managed by ../services/interruptState.ts
+// (addPendingInterrupt, drainPendingInterrupts, etc.)
 
 /** Channels where the user is expected to type plan edit instructions */
 const planEditPendingChannels = new Map<string, { projectName: string }>();
@@ -903,26 +895,32 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
         modeService,
         modelService,
         sendPromptImpl: sendPromptToAntigravity,
-        onTaskComplete: (channel) => {
-            // Auto-queue fallback: if the user hasn't tapped Queue/Send Now/Discard yet,
-            // automatically dispatch the pending message now that the current task is done.
-            const chKey = channelKey(channel);
-            const pending = pendingInterrupts.get(chKey);
-            if (!pending) return;
-            pendingInterrupts.delete(chKey);
-            logger.info(`[autoQueue] Auto-dispatching pending interrupt for ${chKey}`);
-            // Edit the interrupt keyboard message to show it was auto-queued
-            if (pending.interruptMsgId && bridge.botApi) {
-                bridge.botApi.editMessageText(channel.chatId, pending.interruptMsgId, '📥 Task finished — sending your queued message…', { parse_mode: 'HTML' })
-                    .catch((e: any) => { logger.debug('[autoQueue] editMessage failed:', e); });
+        onTaskComplete: (channel, wsKey) => {
+            // Auto-queue fallback: when a task finishes, auto-dispatch any
+            // pending interrupts the user hasn't acted on yet.
+            if (!hasPendingInterrupts(wsKey)) return;
+
+            const queued = drainPendingInterrupts(wsKey);
+            logger.info(`[autoQueue] Task done for ${wsKey} — auto-dispatching ${queued.length} queued message(s)`);
+
+            for (const pending of queued) {
+                // Edit the interrupt keyboard message to show it was auto-queued
+                if (pending.interruptMsgId && bridge.botApi) {
+                    bridge.botApi.editMessageText(
+                        pending.channel.chatId,
+                        pending.interruptMsgId,
+                        '📥 Task finished — sending your queued message…',
+                        { parse_mode: 'HTML' },
+                    ).catch((e: any) => { logger.debug('[autoQueue] editMessage failed:', e); });
+                }
+                promptDispatcher.send({
+                    channel: pending.channel,
+                    prompt: pending.prompt,
+                    cdp: pending.cdp,
+                    inboundImages: pending.inboundImages,
+                    options: pending.options,
+                }).catch((e: any) => { logger.error('[autoQueue] dispatch failed:', e); });
             }
-            promptDispatcher.send({
-                channel: pending.channel,
-                prompt: pending.prompt,
-                cdp: pending.cdp,
-                inboundImages: pending.inboundImages,
-                options: pending.options,
-            }).catch((e: any) => { logger.error('[autoQueue] dispatch failed:', e); });
         },
     });
 
@@ -1694,22 +1692,21 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
                 : data.startsWith(INTERRUPT_NOW_PREFIX)
                     ? data.slice(INTERRUPT_NOW_PREFIX.length)
                     : data.slice(INTERRUPT_DISCARD_PREFIX.length);
-            const pending = pendingInterrupts.get(targetKey);
 
             if (data.startsWith(INTERRUPT_DISCARD_PREFIX)) {
-                pendingInterrupts.delete(targetKey);
+                // Discard the first pending interrupt
+                shiftPendingInterrupt(targetKey);
                 try { await ctx.editMessageText('🗑 Message discarded.'); } catch (e) { logger.debug('[editMsg] Telegram edit failed:', e); }
                 await ctx.answerCallbackQuery({ text: 'Discarded' });
                 return;
             }
 
+            const pending = shiftPendingInterrupt(targetKey);
             if (!pending) {
                 try { await ctx.editMessageText('✅ Task finished — your message was already processed.'); } catch (e) { logger.debug('[editMsg] Telegram edit failed:', e); }
                 await ctx.answerCallbackQuery({ text: 'Already processed' });
                 return;
             }
-
-            pendingInterrupts.delete(targetKey);
 
             if (data.startsWith(INTERRUPT_NOW_PREFIX)) {
                 // Stop current generation, then send the new prompt
@@ -1726,7 +1723,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
                 } catch (e) { logger.debug('[interrupt:now] Stop button click failed:', e); }
 
                 // Dispatch — the promise chain will wait for the current task to finish
-                // (the stop button triggers onComplete with wasStoppedByUser, releasing the lock)
+                addBypass(targetKey);
                 promptDispatcher.send({
                     channel: pending.channel,
                     prompt: pending.prompt,
@@ -1999,7 +1996,10 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
 
         // ── Concurrency gate: check if workspace is busy ────────────────────
         const wsKey = promptDispatcher.getWorkspaceKey(ch, resolved.cdp);
-        if (promptDispatcher.isBusy(ch, resolved.cdp) && !consumeBypass(wsKey)) {
+        const busy = promptDispatcher.isBusy(ch, resolved.cdp);
+        const bypassed = busy ? consumeBypass(wsKey) : false;
+        logger.info(`[concurrencyGate] wsKey=${wsKey} busy=${busy} bypassed=${bypassed}`);
+        if (busy && !bypassed) {
             const dispatchOptions = { chatSessionService, chatSessionRepo, topicManager, titleGenerator };
             const position = addPendingInterrupt(wsKey, {
                 prompt: text,

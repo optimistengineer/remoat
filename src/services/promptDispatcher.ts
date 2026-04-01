@@ -1,4 +1,5 @@
 import { ChatSessionRepository } from '../database/chatSessionRepository';
+import { logger } from '../utils/logger';
 import { CdpBridge, TelegramChannel } from './cdpBridgeManager';
 import { CdpService } from './cdpService';
 import { ModeService } from './modeService';
@@ -38,7 +39,7 @@ export interface PromptDispatcherDeps {
         options?: PromptDispatchOptions,
     ) => Promise<void>;
     /** Called after each task completes (success or error). Used for auto-queue fallback. */
-    onTaskComplete?: (channel: TelegramChannel) => void;
+    onTaskComplete?: (channel: TelegramChannel, wsKey: string) => void;
 }
 
 export class PromptDispatcher {
@@ -68,7 +69,9 @@ export class PromptDispatcher {
      */
     isBusy(ch: TelegramChannel, cdp: CdpService): boolean {
         const lockKey = this.getWorkspaceKey(ch, cdp);
-        return this.workspaceLocks.has(lockKey);
+        const busy = this.workspaceLocks.has(lockKey);
+        logger.debug(`[PromptDispatcher] isBusy(${lockKey}) = ${busy} (locks: ${this.workspaceLocks.size})`);
+        return busy;
     }
 
     async send(req: PromptDispatchRequest): Promise<void> {
@@ -94,6 +97,7 @@ export class PromptDispatcher {
         ).catch(() => { /* errors handled inside sendPromptImpl */ });
 
         this.workspaceLocks.set(lockKey, current);
+        logger.debug(`[PromptDispatcher] Lock ACQUIRED: ${lockKey} (total: ${this.workspaceLocks.size})`);
         // Also keep per-channel entry so callers that check channel ordering still work
         this.channelLocks.set(chKey, current);
 
@@ -102,11 +106,12 @@ export class PromptDispatcher {
         } finally {
             if (this.workspaceLocks.get(lockKey) === current) {
                 this.workspaceLocks.delete(lockKey);
+                logger.debug(`[PromptDispatcher] Lock RELEASED: ${lockKey} (total: ${this.workspaceLocks.size})`);
             }
             if (this.channelLocks.get(chKey) === current) {
                 this.channelLocks.delete(chKey);
             }
-            this.deps.onTaskComplete?.(req.channel);
+            this.deps.onTaskComplete?.(req.channel, lockKey);
         }
     }
 }
