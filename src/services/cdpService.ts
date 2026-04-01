@@ -259,6 +259,42 @@ export class CdpService extends EventEmitter {
         });
     }
 
+    /**
+     * Closes the Antigravity instance completely via the CDP HTTP JSON endpoint.
+     */
+    public async closeBrowserTarget(): Promise<void> {
+        if (!this.targetUrl) return;
+
+        const match = this.targetUrl.match(/ws:\/\/(.+?)\/devtools\/page\/(.+)/);
+        if (match) {
+            const hostAndPort = match[1];
+            const targetId = match[2];
+
+            try {
+                // Drop the WebSocket to avoid immediate reconnect cascade during termination
+                await this.disconnect();
+
+                await new Promise<void>((resolve, reject) => {
+                    const req = http.request(`http://${hostAndPort}/json/close/${targetId}`, { method: 'PUT' }, (res) => {
+                        res.resume(); // drain response
+                        if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+                            resolve();
+                        } else {
+                            reject(new Error(`Close failed with status ${res.statusCode}`));
+                        }
+                    });
+                    req.on('error', reject);
+                    req.end();
+                });
+            } catch (err: any) {
+                logger.error(`[CdpService] Failed to remotely close browser target: ${err.message}`);
+                throw err;
+            }
+        } else {
+            throw new Error('Could not parse target context for closing.');
+        }
+    }
+
     async disconnect(): Promise<void> {
         this.stopHeartbeat();
         // Suppress 'disconnected' event (and reconnect attempts) during intentional shutdown

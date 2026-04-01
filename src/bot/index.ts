@@ -1031,6 +1031,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             `/chat — Show current session info\n\n` +
             `<b>⏹️ Control</b>\n` +
             `/stop — Interrupt active LLM generation\n` +
+            `/close — Terminate active Antigravity session\n` +
             `/screenshot — Capture Antigravity screen\n\n` +
             `<b>⚙️ Settings</b>\n` +
             `/mode — Display and change execution mode\n` +
@@ -1215,6 +1216,26 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
         }
     });
 
+    // /close command
+    bot.command('close', async (ctx) => {
+        const ch = getChannel(ctx);
+        const resolved = await resolveWorkspaceAndCdp(ch);
+        const workspacePath = resolved?.workspacePath;
+
+        if (!workspacePath) {
+            await ctx.reply('⚠️ No active project bound to this chat. Cannot close.');
+            return;
+        }
+
+        const projectName = bridge.pool.extractProjectName(workspacePath);
+        
+        try {
+            await bridge.pool.closeBrowserWorkspace(projectName);
+            await replyHtml(ctx, `<b>🛑 Workspace Closed</b>\nThe browser instance for <code>${escapeHtml(projectName)}</code> has been terminated.`);
+        } catch (e: any) {
+            await ctx.reply(`❌ Error closing workspace: ${e.message}`);
+        }
+    });
     // /project command
     bot.command('project', async (ctx) => {
         const workspaces = workspaceService.scanWorkspaces();
@@ -2229,6 +2250,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
                     { command: 'mode', description: 'Change execution mode' },
                     { command: 'model', description: 'Change LLM model' },
                     { command: 'stop', description: 'Interrupt active generation' },
+                    { command: 'close', description: 'Terminate active Antigravity session' },
                     { command: 'screenshot', description: 'Capture Antigravity screen' },
                     { command: 'template', description: 'Show prompt templates' },
                     { command: 'template_add', description: 'Register a template' },

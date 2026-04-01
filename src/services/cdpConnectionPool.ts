@@ -133,6 +133,21 @@ export class CdpConnectionPool extends EventEmitter {
     }
 
     /**
+     * Completely close the Antigravity instance for the specified workspace via CDP.
+     */
+    async closeBrowserWorkspace(projectName: string): Promise<void> {
+        const cdp = this.connections.get(projectName);
+        if (cdp) {
+            try {
+                await cdp.closeBrowserTarget();
+            } catch (err) {
+                logger.error(`[CdpConnectionPool] Error while closing browser for ${projectName}:`, err);
+            }
+        }
+        this.disconnectWorkspace(projectName);
+    }
+
+    /**
      * Disconnect all workspace connections.
      */
     disconnectAll(): void {
