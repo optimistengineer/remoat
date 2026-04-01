@@ -1474,9 +1474,9 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             if (!resolved) {
                 const cdp = getCurrentCdp(bridge);
                 if (!cdp) { await ctx.answerCallbackQuery({ text: 'Not connected.' }); return; }
-                await promptDispatcher.send({ channel: ch, prompt: template.prompt, cdp, inboundImages: [], options: { chatSessionService, chatSessionRepo, topicManager, titleGenerator } });
+                promptDispatcher.send({ channel: ch, prompt: template.prompt, cdp, inboundImages: [], options: { chatSessionService, chatSessionRepo, topicManager, titleGenerator } }).catch((e) => logger.error('[template] dispatch failed:', e));
             } else {
-                await promptDispatcher.send({ channel: ch, prompt: template.prompt, cdp: resolved.cdp, inboundImages: [], options: { chatSessionService, chatSessionRepo, topicManager, titleGenerator } });
+                promptDispatcher.send({ channel: ch, prompt: template.prompt, cdp: resolved.cdp, inboundImages: [], options: { chatSessionService, chatSessionRepo, topicManager, titleGenerator } }).catch((e) => logger.error('[template] dispatch failed:', e));
             }
             await ctx.answerCallbackQuery({ text: `Running: ${template.name}` });
             return;
@@ -1928,13 +1928,13 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
                 return;
             }
             await ctx.reply('Sending plan edit...');
-            await promptDispatcher.send({
+            promptDispatcher.send({
                 channel: ch,
                 prompt: editPrompt,
                 cdp,
                 inboundImages: [],
                 options: { chatSessionService, chatSessionRepo, topicManager, titleGenerator },
-            });
+            }).catch((e) => logger.error('[planEdit] dispatch failed:', e));
             return;
         }
 
@@ -1973,13 +1973,13 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             if (result.prompt) {
                 const cdp = getCurrentCdp(bridge);
                 if (cdp) {
-                    await promptDispatcher.send({
+                    promptDispatcher.send({
                         channel: ch,
                         prompt: result.prompt,
                         cdp,
                         inboundImages: [],
                         options: { chatSessionService, chatSessionRepo, topicManager, titleGenerator },
-                    });
+                    }).catch((e) => logger.error('[slashCmd] dispatch failed:', e));
                 } else {
                     await ctx.reply('Not connected to CDP. Send a message first to connect to a project.');
                 }
@@ -2050,13 +2050,16 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
         const userMsgDetector = bridge.pool.getUserMessageDetector?.(resolved.projectName);
         if (userMsgDetector) userMsgDetector.addEchoHash(text);
 
-        await promptDispatcher.send({
+        // Fire-and-forget: do NOT await so Grammy can process the next update immediately.
+        // The lock is set synchronously inside send() before its first await,
+        // so isBusy() will see it when the next message handler runs.
+        promptDispatcher.send({
             channel: ch,
             prompt: text,
             cdp: resolved.cdp,
             inboundImages: [],
             options: { chatSessionService, chatSessionRepo, topicManager, titleGenerator },
-        });
+        }).catch((e) => logger.error('[textMsg] dispatch failed:', e));
     });
 
     // Photo message handler
@@ -2111,17 +2114,15 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
         }
         // ── End concurrency gate ────────────────────────────────────────────
 
-        try {
-            await promptDispatcher.send({
-                channel: ch,
-                prompt: caption,
-                cdp: resolved.cdp,
-                inboundImages,
-                options: { chatSessionService, chatSessionRepo, topicManager, titleGenerator },
-            });
-        } finally {
-            await cleanupInboundImageAttachments(inboundImages);
-        }
+        // Fire-and-forget; cleanup images after dispatch completes (not immediately)
+        promptDispatcher.send({
+            channel: ch,
+            prompt: caption,
+            cdp: resolved.cdp,
+            inboundImages,
+            options: { chatSessionService, chatSessionRepo, topicManager, titleGenerator },
+        }).catch((e) => logger.error('[photoMsg] dispatch failed:', e))
+         .finally(() => cleanupInboundImageAttachments(inboundImages).catch(() => {}));
     });
 
     // Voice message handler (voice-to-prompt via local Whisper transcription)
@@ -2166,13 +2167,13 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             if (result.prompt) {
                 const cdp = getCurrentCdp(bridge);
                 if (cdp) {
-                    await promptDispatcher.send({
+                    promptDispatcher.send({
                         channel: ch,
                         prompt: result.prompt,
                         cdp,
                         inboundImages: [],
                         options: { chatSessionService, chatSessionRepo, topicManager, titleGenerator },
-                    });
+                    }).catch((e) => logger.error('[voiceCmd] dispatch failed:', e));
                 }
             }
             return;
@@ -2216,13 +2217,14 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
         const userMsgDetector = bridge.pool.getUserMessageDetector?.(resolved.projectName);
         if (userMsgDetector) userMsgDetector.addEchoHash(transcript);
 
-        await promptDispatcher.send({
+        // Fire-and-forget: same pattern as text handler
+        promptDispatcher.send({
             channel: ch,
             prompt: transcript,
             cdp: resolved.cdp,
             inboundImages: [],
             options: { chatSessionService, chatSessionRepo, topicManager, titleGenerator },
-        });
+        }).catch((e) => logger.error('[voiceMsg] dispatch failed:', e));
     });
 
     logger.info('Starting Remoat Telegram bot...');
