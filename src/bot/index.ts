@@ -857,7 +857,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
                 channel.chatId,
                 `⏳ <b>Message queued</b> — Antigravity is still working.\n\n<i>${escapeHtml(preview)}</i>\n\nYour message will be sent automatically when the current response completes.`,
                 { parse_mode: 'HTML', message_thread_id: channel.threadId },
-            ).catch(() => {});
+            ).catch((e) => { logger.debug('[notifyQueued] sendMessage failed:', e); });
         },
     });
 
