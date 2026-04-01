@@ -78,7 +78,7 @@ describe('assistantDomExtractor', () => {
         expect(result.diagnostics.segmentCounts.feedback).toBe(2);
     });
 
-    it('concatenates body text when split across multiple segments', () => {
+    it('uses only the first body segment to prevent artifact contamination', () => {
         const payload = buildPayload([
             {
                 kind: 'assistant-body',
@@ -105,7 +105,7 @@ describe('assistantDomExtractor', () => {
 
         const result = classifyAssistantSegments(payload);
 
-        expect(result.finalOutputText).toBe('前半です。\n\n後半です。');
+        expect(result.finalOutputText).toBe('前半です。');
         expect(result.activityLines).toEqual(['mcp.search']);
         expect(result.feedback).toEqual([]);
     });

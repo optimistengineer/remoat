@@ -79,7 +79,10 @@ export function classifyAssistantSegments(payload: unknown): ClassifyResult {
 
         switch (seg.kind) {
             case 'assistant-body':
-                if (seg.text && seg.text.trim()) {
+                // Only the FIRST assistant-body segment contains the actual response text.
+                // Subsequent segments are artifact card tool-call outputs that leaked into
+                // the DOM and must not be appended to the Telegram message.
+                if (bodyTexts.length === 0 && seg.text && seg.text.trim()) {
                     bodyTexts.push(seg.text);
                 }
                 break;
@@ -141,7 +144,15 @@ export function extractAssistantSegmentsPayloadScript(): string {
     // assistant content nodes in Antigravity's DOM.
     return `(() => {
     var panel = document.querySelector('.antigravity-agent-side-panel');
-    var scope = panel || document;
+    var rootScope = panel || document;
+
+    // Scope to the LAST assistant message turn to prevent cross-turn spillover.
+    // This is the critical isolation boundary — without it, tool calls, thinking
+    // logs, and response text from earlier turns leak into the current extraction.
+    var assistantTurns = rootScope.querySelectorAll('[data-message-author-role="assistant"]');
+    var scope = assistantTurns.length > 0
+        ? assistantTurns[assistantTurns.length - 1]
+        : rootScope;
 
     // Same selectors as RESPONSE_TEXT — ordered by specificity
     var selectors = [
