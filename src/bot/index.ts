@@ -76,7 +76,7 @@ import {
     drainPendingInterrupts,
     hasPendingInterrupts,
     clearPendingInterrupts,
-    addBypass,
+
     consumeBypass,
     MAX_QUEUE_DEPTH,
 } from '../services/interruptState';
@@ -1722,8 +1722,8 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
                     userStopRequestedChannels.add(channelKey(pending.channel));
                 } catch (e) { logger.debug('[interrupt:now] Stop button click failed:', e); }
 
-                // Dispatch — the promise chain will wait for the current task to finish
-                addBypass(targetKey);
+                // Dispatch — send() chains on the workspace lock automatically;
+                // no bypass needed (bypass is only checked in the text message handler).
                 promptDispatcher.send({
                     channel: pending.channel,
                     prompt: pending.prompt,
@@ -1788,113 +1788,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             await ctx.answerCallbackQuery({ text: `${processed} session(s) ${action}` });
             return;
         }
-        // Interrupt queue buttons (concurrency management)
-        if (data.startsWith('interrupt:')) {
-            const parts = data.split(':');
-            const action = parts[1]; // "queue", "now", or "discard"
-            const wsKey = parts.slice(2).join(':');
 
-            if (action === 'queue') {
-                // Drain all pending interrupts and dispatch them in order
-                const allPending = drainPendingInterrupts(wsKey);
-                if (allPending.length === 0) {
-                    await ctx.answerCallbackQuery({ text: 'No pending messages.' });
-                    return;
-                }
-
-                try { await ctx.editMessageText('📥 Message queued — will process after current task.'); } catch { }
-                await ctx.answerCallbackQuery({ text: 'Queued' });
-
-                // Dispatch all pending messages in order (they'll serialize on the workspace lock)
-                for (const pending of allPending) {
-                    addBypass(wsKey);
-                    promptDispatcher.send({
-                        channel: pending.channel,
-                        prompt: pending.prompt,
-                        cdp: pending.cdp,
-                        inboundImages: pending.inboundImages,
-                        options: pending.options,
-                    }).catch((err) => logger.error('[Interrupt:queue] Dispatch error:', err));
-                }
-                return;
-            }
-
-            if (action === 'now') {
-                // Drain all pending — we'll stop current generation and send the first, queue the rest
-                const allPending = drainPendingInterrupts(wsKey);
-                if (allPending.length === 0) {
-                    await ctx.answerCallbackQuery({ text: 'No pending messages.' });
-                    return;
-                }
-
-                try { await ctx.editMessageText('⚡ Stopping current AI generation and sending your new message…'); } catch { }
-                await ctx.answerCallbackQuery({ text: 'Stopping & sending' });
-
-                // Click Antigravity's stop button via CDP
-                const firstPending = allPending[0];
-                try {
-                    const contextId = firstPending.cdp.getPrimaryContextId();
-                    const callParams: Record<string, unknown> = {
-                        expression: RESPONSE_SELECTORS.CLICK_STOP_BUTTON,
-                        returnByValue: true,
-                        awaitPromise: false,
-                    };
-                    if (contextId !== null) callParams.contextId = contextId;
-                    await firstPending.cdp.call('Runtime.evaluate', callParams);
-
-                    // Mark stop so the response monitor knows it was user-initiated
-                    userStopRequestedChannels.add(channelKey(firstPending.channel));
-                } catch (e: any) {
-                    logger.error('[Interrupt:now] Failed to click stop button:', e.message);
-                }
-
-                // Dispatch all pending messages in order
-                for (const pending of allPending) {
-                    addBypass(wsKey);
-                    promptDispatcher.send({
-                        channel: pending.channel,
-                        prompt: pending.prompt,
-                        cdp: pending.cdp,
-                        inboundImages: pending.inboundImages,
-                        options: pending.options,
-                    }).catch((err) => logger.error('[Interrupt:now] Dispatch error:', err));
-                }
-                return;
-            }
-
-            if (action === 'discard') {
-                // Remove the first pending message; promote the next one
-                const discarded = shiftPendingInterrupt(wsKey);
-                if (!discarded) {
-                    await ctx.answerCallbackQuery({ text: 'No pending messages.' });
-                    return;
-                }
-
-                const remaining = getQueueDepth(wsKey);
-                if (remaining > 0) {
-                    // Promote next message: show keyboard for it
-                    const next = getFirstPendingInterrupt(wsKey);
-                    const preview = next ? (next.prompt.length > 60 ? next.prompt.slice(0, 57) + '…' : next.prompt) : '';
-                    const newKeyboard = new InlineKeyboard()
-                        .text('📥 Queue', `interrupt:queue:${wsKey}`)
-                        .text('⚡ Stop & Send Now', `interrupt:now:${wsKey}`)
-                        .text('🗑 Discard', `interrupt:discard:${wsKey}`);
-                    try {
-                        await ctx.editMessageText(
-                            `🗑 Previous message discarded.\n\n⏳ <b>AI is still generating…</b>\nNext in queue: <i>${escapeHtml(preview)}</i>\n(+${remaining - 1} more)`,
-                            { parse_mode: 'HTML', reply_markup: newKeyboard },
-                        );
-                    } catch { }
-                } else {
-                    try { await ctx.editMessageText('🗑 Message discarded.'); } catch { }
-                }
-                await ctx.answerCallbackQuery({ text: 'Discarded' });
-                return;
-            }
-
-            await ctx.answerCallbackQuery({ text: 'Unknown interrupt action.' });
-            return;
-        }
 
         await ctx.answerCallbackQuery();
     });
