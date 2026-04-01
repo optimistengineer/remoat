@@ -67,6 +67,19 @@ import {
     INTERRUPT_QUEUE_PREFIX, INTERRUPT_NOW_PREFIX, INTERRUPT_DISCARD_PREFIX,
     buildInterruptUI,
 } from '../ui/queueUi';
+import {
+    addPendingInterrupt,
+    getFirstPendingInterrupt,
+    getAllPendingInterrupts,
+    getQueueDepth,
+    shiftPendingInterrupt,
+    drainPendingInterrupts,
+    hasPendingInterrupts,
+    clearPendingInterrupts,
+    addBypass,
+    consumeBypass,
+    MAX_QUEUE_DEPTH,
+} from '../services/interruptState';
 
 const PHASE_ICONS = {
     sending: '📡',
@@ -603,7 +616,7 @@ async function sendPromptToAntigravity(
                 if (wasStoppedByUser) {
                     logger.info(`[sendPrompt:${monitorTraceId}] Stopped by user`);
                     await sendMsg('⏹️ Generation stopped.');
-                    resolveMonitorDone();
+                    resolveMonitorDone?.();
                     return;
                 }
 
@@ -785,14 +798,13 @@ async function sendPromptToAntigravity(
                     }
 
                     await sendGeneratedImages(finalOutputText || '');
-                } catch (error) { logger.error(`[sendPrompt:${monitorTraceId}] onComplete failed:`, error); }
-                resolveMonitorDone();
+                } catch (error) { logger.error(`[sendPrompt:${monitorTraceId}] onComplete failed:`, error); } finally { resolveMonitorDone?.(); }
             },
-            onTimeout: async (lastText) => {
-                isFinalized = true;
-                if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
-                userStopRequestedChannels.delete(channelKey(channel));
+            onTimeout: async (lastText: string) => {
                 try {
+                    isFinalized = true;
+                    if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
+                    userStopRequestedChannels.delete(channelKey(channel));
                     const elapsed = Math.round((Date.now() - startTime) / 1000);
                     const timeoutText = (lastText && lastText.trim().length > 0) ? lastText : lastProgressText;
                     const timeoutIsHtml = monitor!.getLastExtractionSource() === 'structured';
@@ -806,8 +818,7 @@ async function sendPromptToAntigravity(
                     liveActivityUpdateVersion += 1;
                     thinkingActive = false;
                     await setProgressMessage(`<b>${PHASE_ICONS.timeout} ${escapeHtml(modelLabel)} · ${elapsed}s</b>\n\n${buildProgressBody()}`, { expectedVersion: liveActivityUpdateVersion });
-                } catch (error) { logger.error(`[sendPrompt:${monitorTraceId}] onTimeout failed:`, error); }
-                resolveMonitorDone();
+                } catch (error) { logger.error(`[sendPrompt:${monitorTraceId}] onTimeout failed:`, error); } finally { resolveMonitorDone?.(); }
             },
         });
 
@@ -827,10 +838,38 @@ async function sendPromptToAntigravity(
         userStopRequestedChannels.delete(channelKey(channel));
         if (elapsedTimer) { clearInterval(elapsedTimer); }
         if (monitor) { await monitor.stop().catch(() => {}); }
+        const resolve = resolveMonitorDone as (() => void) | null;
+        if (resolve) resolve();
         await sendEmbed(`${PHASE_ICONS.error} Error`, t(`Error occurred during processing: ${e.message}`));
         // Safety: resolve the gate so the dispatcher lock is released on early errors
         // (e.g., if monitor.start() throws before onComplete/onTimeout ever fires).
         resolveMonitorDone();
+    }
+
+    // Hold the dispatcher's workspace lock until the monitor finishes.
+    // Without this, sendPromptToAntigravity resolves immediately after
+    // monitor.start() (which only captures baselines and schedules polling),
+    // releasing the lock and allowing concurrent prompts on the same workspace.
+    if (monitorDone) {
+        await monitorDone;
+    }
+
+    // Auto-dispatch any pending interrupt queue items now that the lock is released.
+    // If the user never pressed Queue/Send/Discard, their messages auto-queue here.
+    const wsKey = cdp.getCurrentWorkspaceName() ? `ws:${cdp.getCurrentWorkspaceName()}` : channelKey(channel);
+    if (hasPendingInterrupts(wsKey)) {
+        const pending = drainPendingInterrupts(wsKey);
+        logger.info(`[AutoQueue] Dispatching ${pending.length} pending message(s) for ${wsKey}`);
+        for (const item of pending) {
+            // No bypass needed — lock is already released
+            // We use dynamic import to avoid circular dependency with promptDispatcher
+            // Instead, we re-call sendPromptToAntigravity directly (same call chain as promptDispatcher)
+            sendPromptToAntigravity(
+                bridge, item.channel, item.prompt, item.cdp,
+                modeService, modelService, item.inboundImages,
+                item.options,
+            ).catch((err) => logger.error('[AutoQueue] Dispatch error:', err));
+        }
     }
 }
 
@@ -1731,6 +1770,113 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             await ctx.answerCallbackQuery({ text: `${processed} session(s) ${action}` });
             return;
         }
+        // Interrupt queue buttons (concurrency management)
+        if (data.startsWith('interrupt:')) {
+            const parts = data.split(':');
+            const action = parts[1]; // "queue", "now", or "discard"
+            const wsKey = parts.slice(2).join(':');
+
+            if (action === 'queue') {
+                // Drain all pending interrupts and dispatch them in order
+                const allPending = drainPendingInterrupts(wsKey);
+                if (allPending.length === 0) {
+                    await ctx.answerCallbackQuery({ text: 'No pending messages.' });
+                    return;
+                }
+
+                try { await ctx.editMessageText('📥 Message queued — will process after current task.'); } catch { }
+                await ctx.answerCallbackQuery({ text: 'Queued' });
+
+                // Dispatch all pending messages in order (they'll serialize on the workspace lock)
+                for (const pending of allPending) {
+                    addBypass(wsKey);
+                    promptDispatcher.send({
+                        channel: pending.channel,
+                        prompt: pending.prompt,
+                        cdp: pending.cdp,
+                        inboundImages: pending.inboundImages,
+                        options: pending.options,
+                    }).catch((err) => logger.error('[Interrupt:queue] Dispatch error:', err));
+                }
+                return;
+            }
+
+            if (action === 'now') {
+                // Drain all pending — we'll stop current generation and send the first, queue the rest
+                const allPending = drainPendingInterrupts(wsKey);
+                if (allPending.length === 0) {
+                    await ctx.answerCallbackQuery({ text: 'No pending messages.' });
+                    return;
+                }
+
+                try { await ctx.editMessageText('⚡ Stopping current AI generation and sending your new message…'); } catch { }
+                await ctx.answerCallbackQuery({ text: 'Stopping & sending' });
+
+                // Click Antigravity's stop button via CDP
+                const firstPending = allPending[0];
+                try {
+                    const contextId = firstPending.cdp.getPrimaryContextId();
+                    const callParams: Record<string, unknown> = {
+                        expression: RESPONSE_SELECTORS.CLICK_STOP_BUTTON,
+                        returnByValue: true,
+                        awaitPromise: false,
+                    };
+                    if (contextId !== null) callParams.contextId = contextId;
+                    await firstPending.cdp.call('Runtime.evaluate', callParams);
+
+                    // Mark stop so the response monitor knows it was user-initiated
+                    userStopRequestedChannels.add(channelKey(firstPending.channel));
+                } catch (e: any) {
+                    logger.error('[Interrupt:now] Failed to click stop button:', e.message);
+                }
+
+                // Dispatch all pending messages in order
+                for (const pending of allPending) {
+                    addBypass(wsKey);
+                    promptDispatcher.send({
+                        channel: pending.channel,
+                        prompt: pending.prompt,
+                        cdp: pending.cdp,
+                        inboundImages: pending.inboundImages,
+                        options: pending.options,
+                    }).catch((err) => logger.error('[Interrupt:now] Dispatch error:', err));
+                }
+                return;
+            }
+
+            if (action === 'discard') {
+                // Remove the first pending message; promote the next one
+                const discarded = shiftPendingInterrupt(wsKey);
+                if (!discarded) {
+                    await ctx.answerCallbackQuery({ text: 'No pending messages.' });
+                    return;
+                }
+
+                const remaining = getQueueDepth(wsKey);
+                if (remaining > 0) {
+                    // Promote next message: show keyboard for it
+                    const next = getFirstPendingInterrupt(wsKey);
+                    const preview = next ? (next.prompt.length > 60 ? next.prompt.slice(0, 57) + '…' : next.prompt) : '';
+                    const newKeyboard = new InlineKeyboard()
+                        .text('📥 Queue', `interrupt:queue:${wsKey}`)
+                        .text('⚡ Stop & Send Now', `interrupt:now:${wsKey}`)
+                        .text('🗑 Discard', `interrupt:discard:${wsKey}`);
+                    try {
+                        await ctx.editMessageText(
+                            `🗑 Previous message discarded.\n\n⏳ <b>AI is still generating…</b>\nNext in queue: <i>${escapeHtml(preview)}</i>\n(+${remaining - 1} more)`,
+                            { parse_mode: 'HTML', reply_markup: newKeyboard },
+                        );
+                    } catch { }
+                } else {
+                    try { await ctx.editMessageText('🗑 Message discarded.'); } catch { }
+                }
+                await ctx.answerCallbackQuery({ text: 'Discarded' });
+                return;
+            }
+
+            await ctx.answerCallbackQuery({ text: 'Unknown interrupt action.' });
+            return;
+        }
 
         await ctx.answerCallbackQuery();
     });
@@ -1830,25 +1976,39 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             return;
         }
 
-        // Busy check: if Antigravity is still generating, show interrupt keyboard
-        if (promptDispatcher.isBusy(ch, resolved.cdp)) {
+        // ── Concurrency gate: check if workspace is busy ────────────────────
+        const wsKey = promptDispatcher.getWorkspaceKey(ch, resolved.cdp);
+        if (promptDispatcher.isBusy(ch, resolved.cdp) && !consumeBypass(wsKey)) {
             const dispatchOptions = { chatSessionService, chatSessionRepo, topicManager, titleGenerator };
-            const { text: uiText, keyboard } = buildInterruptUI(key, text);
-            const sent = await bot.api.sendMessage(ch.chatId, uiText, {
-                parse_mode: 'HTML',
-                message_thread_id: ch.threadId,
-                reply_markup: keyboard,
-            });
-            pendingInterrupts.set(key, {
+            const position = addPendingInterrupt(wsKey, {
                 prompt: text,
                 channel: ch,
                 cdp: resolved.cdp,
                 inboundImages: [],
                 options: dispatchOptions,
-                interruptMsgId: sent.message_id,
             });
+
+            if (position === null) {
+                await ctx.reply(`⚠️ Queue full (${MAX_QUEUE_DEPTH} messages pending). Please wait or /stop the current task.`);
+                return;
+            }
+
+            if (position === 1) {
+                // First in queue — show the interrupt keyboard
+                const { text: uiText, keyboard } = buildInterruptUI(wsKey, text);
+                const sent = await bot.api.sendMessage(ch.chatId, uiText, {
+                    parse_mode: 'HTML',
+                    message_thread_id: ch.threadId,
+                    reply_markup: keyboard,
+                });
+                const pending = getFirstPendingInterrupt(wsKey);
+                if (pending) pending.interruptMsgId = sent.message_id;
+            } else {
+                await ctx.reply(`📥 Message queued (#${position} in line)`);
+            }
             return;
         }
+        // ── End concurrency gate ────────────────────────────────────────────
 
         const session = chatSessionRepo.findByChannelId(key);
         if (session?.displayName) {
@@ -1896,6 +2056,39 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             [largest],
             String(ctx.message.message_id),
         );
+
+        // ── Concurrency gate ────────────────────────────────────────────────
+        const wsKey = promptDispatcher.getWorkspaceKey(ch, resolved.cdp);
+        if (promptDispatcher.isBusy(ch, resolved.cdp) && !consumeBypass(wsKey)) {
+            const position = addPendingInterrupt(wsKey, {
+                prompt: caption,
+                channel: ch,
+                cdp: resolved.cdp,
+                inboundImages,
+                options: { chatSessionService, chatSessionRepo, topicManager, titleGenerator },
+            });
+
+            if (position === null) {
+                await cleanupInboundImageAttachments(inboundImages);
+                await ctx.reply(`⚠️ Queue full (${MAX_QUEUE_DEPTH} messages pending). Please wait or /stop the current task.`);
+                return;
+            }
+
+            if (position === 1) {
+                const keyboard = new InlineKeyboard()
+                    .text('📥 Queue', `interrupt:queue:${wsKey}`)
+                    .text('⚡ Stop & Send Now', `interrupt:now:${wsKey}`)
+                    .text('🗑 Discard', `interrupt:discard:${wsKey}`);
+                await replyHtml(ctx,
+                    `⏳ <b>AI is still generating a response…</b>\n\n🖼️ Photo message queued.`,
+                    keyboard,
+                );
+            } else {
+                await ctx.reply(`📥 Photo message queued (#${position} in line)`);
+            }
+            return; // Images kept in interruptState; cleaned up on dispatch or discard
+        }
+        // ── End concurrency gate ────────────────────────────────────────────
 
         try {
             await promptDispatcher.send({
@@ -1965,6 +2158,39 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
         }
 
         await ctx.reply(`📝 "${transcript}"`);
+
+        // ── Concurrency gate ────────────────────────────────────────────────
+        const wsKey = promptDispatcher.getWorkspaceKey(ch, resolved.cdp);
+        if (promptDispatcher.isBusy(ch, resolved.cdp) && !consumeBypass(wsKey)) {
+            const position = addPendingInterrupt(wsKey, {
+                prompt: transcript,
+                channel: ch,
+                cdp: resolved.cdp,
+                inboundImages: [],
+                options: { chatSessionService, chatSessionRepo, topicManager, titleGenerator },
+            });
+
+            if (position === null) {
+                await ctx.reply(`⚠️ Queue full (${MAX_QUEUE_DEPTH} messages pending). Please wait or /stop the current task.`);
+                return;
+            }
+
+            if (position === 1) {
+                const keyboard = new InlineKeyboard()
+                    .text('📥 Queue', `interrupt:queue:${wsKey}`)
+                    .text('⚡ Stop & Send Now', `interrupt:now:${wsKey}`)
+                    .text('🗑 Discard', `interrupt:discard:${wsKey}`);
+                const preview = transcript.length > 80 ? transcript.slice(0, 77) + '…' : transcript;
+                await replyHtml(ctx,
+                    `⏳ <b>AI is still generating a response…</b>\n\n🎙️ Voice: <i>${escapeHtml(preview)}</i>`,
+                    keyboard,
+                );
+            } else {
+                await ctx.reply(`📥 Voice message queued (#${position} in line)`);
+            }
+            return;
+        }
+        // ── End concurrency gate ────────────────────────────────────────────
 
         const userMsgDetector = bridge.pool.getUserMessageDetector?.(resolved.projectName);
         if (userMsgDetector) userMsgDetector.addEchoHash(transcript);

@@ -14,7 +14,12 @@ export const RESPONSE_SELECTORS = {
      *  Reverse iteration (N-1→0) visits newest first; strict > keeps it. */
     RESPONSE_TEXT: `(() => {
         const panel = document.querySelector('.antigravity-agent-side-panel');
-        const scopes = [panel, document].filter(Boolean);
+        const rootScope = panel || document;
+
+        // Scope to the LAST assistant message turn to prevent cross-turn spillover.
+        const assistantTurns = rootScope.querySelectorAll('[data-message-author-role="assistant"]');
+        const lastTurn = assistantTurns.length > 0 ? assistantTurns[assistantTurns.length - 1] : null;
+        const scopes = lastTurn ? [lastTurn] : [rootScope];
 
         const selectors = [
             { sel: '.rendered-markdown', score: 10 },

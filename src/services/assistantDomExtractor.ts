@@ -141,7 +141,15 @@ export function extractAssistantSegmentsPayloadScript(): string {
     // assistant content nodes in Antigravity's DOM.
     return `(() => {
     var panel = document.querySelector('.antigravity-agent-side-panel');
-    var scope = panel || document;
+    var rootScope = panel || document;
+
+    // Scope to the LAST assistant message turn to prevent cross-turn spillover.
+    // This is the critical isolation boundary — without it, tool calls, thinking
+    // logs, and response text from earlier turns leak into the current extraction.
+    var assistantTurns = rootScope.querySelectorAll('[data-message-author-role="assistant"]');
+    var scope = assistantTurns.length > 0
+        ? assistantTurns[assistantTurns.length - 1]
+        : rootScope;
 
     // Same selectors as RESPONSE_TEXT — ordered by specificity
     var selectors = [

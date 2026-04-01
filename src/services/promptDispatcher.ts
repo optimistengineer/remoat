@@ -53,12 +53,21 @@ export class PromptDispatcher {
         return ch.threadId ? `${ch.chatId}:${ch.threadId}` : String(ch.chatId);
     }
 
-    /** Check whether a prompt is already in-flight for a given channel/workspace. */
-    isBusy(channel: TelegramChannel, cdp: CdpService): boolean {
-        const chKey = this.channelKey(channel);
+    /**
+     * Resolve the workspace lock key for a channel + cdp pair.
+     * Exposed so the interrupt state module can use the same key.
+     */
+    getWorkspaceKey(ch: TelegramChannel, cdp: CdpService): string {
         const wsName = cdp.getCurrentWorkspaceName();
-        const wsKey = wsName ? `ws:${wsName}` : null;
-        const lockKey = wsKey ?? chKey;
+        return wsName ? `ws:${wsName}` : this.channelKey(ch);
+    }
+
+    /**
+     * Check if a workspace is currently processing a prompt.
+     * Returns true when a workspace lock is held (generation in progress).
+     */
+    isBusy(ch: TelegramChannel, cdp: CdpService): boolean {
+        const lockKey = this.getWorkspaceKey(ch, cdp);
         return this.workspaceLocks.has(lockKey);
     }
 
