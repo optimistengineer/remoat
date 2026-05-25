@@ -49,7 +49,7 @@ export interface UiSyncResult {
 /** Antigravity UI DOM selector constants */
 const SELECTORS = {
     /** Chat input box: textbox excluding xterm */
-    CHAT_INPUT: 'div[role="textbox"]:not(.xterm-helper-textarea)',
+    CHAT_INPUT: 'div[role="textbox"]:not(.xterm-helper-textarea), div[contenteditable="true"]:not(.xterm-helper-textarea)',
     /** Submit button search target tag */
     SUBMIT_BUTTON_CONTAINER: 'button',
     /** Submit icon SVG class candidates */
