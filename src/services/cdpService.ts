@@ -422,9 +422,24 @@ export class CdpService extends EventEmitter {
             logger.debug(`  - title="${p.title}" url=${p.url}`);
         }
 
-        // 1. Title match (fast path)
-        const titleMatch = workbenchPages.find((t: any) => t.title?.includes(projectName));
+        // 1. Title match (fast path) — try each ancestor segment of the path
+        // For a nested path like /home/user/opencode/remoat, try segments in
+        // reverse order: ["remoat", "opencode", "user", ...]
+        const pathSegments = workspacePath.split(/[\/\\]/).filter(Boolean).reverse();
+        let titleMatch: any = null;
+        let matchedSegment = projectName;
+        for (const segment of pathSegments) {
+            const found = workbenchPages.find((t: any) =>
+                t.title?.toLowerCase().includes(segment.toLowerCase())
+            );
+            if (found) {
+                titleMatch = found;
+                matchedSegment = segment;
+                break;
+            }
+        }
         if (titleMatch) {
+            logger.debug(`[CdpService] Title matched via segment "${matchedSegment}" for project "${projectName}"`);
             return this.connectToPage(titleMatch, projectName);
         }
 
@@ -565,12 +580,18 @@ export class CdpService extends EventEmitter {
                 const normalizedProject = projectName.toLowerCase();
                 const normalizedWorkspace = workspacePath.toLowerCase();
 
+                const workspaceSegments = normalizedWorkspace.split(/[/\\]/).filter(Boolean);
+                const projectSegments = normalizedProject.split(/[/\\]/).filter(Boolean);
+
                 if (
                     normalizedDetected.includes(normalizedProject) ||
-                    normalizedDetected.includes(normalizedWorkspace)
+                    normalizedDetected.includes(normalizedWorkspace) ||
+                    (normalizedDetected.startsWith('/') && normalizedWorkspace.startsWith(normalizedDetected)) ||
+                    workspaceSegments.includes(normalizedDetected) ||
+                    projectSegments.includes(normalizedDetected)
                 ) {
                     this.currentWorkspaceName = projectName;
-                    logger.debug(`[CdpService] Folder path match success: "${projectName}"`);
+                    logger.debug(`[CdpService] Folder path match success: "${projectName}" (detected="${detectedValue}")`);
                     return true;
                 }
             }
@@ -613,7 +634,7 @@ export class CdpService extends EventEmitter {
             );
         }
 
-        const launchArgs = [`--remote-debugging-port=${cdpPort}`, '--new-window', workspacePath];
+        const launchArgs = [`--remote-debugging-port=${cdpPort}`, '--reuse-window', workspacePath];
         logger.debug(`[CdpService] Launching Antigravity: ${antigravityCli} ${launchArgs.join(' ')}`);
         try {
             await this.runCommand(antigravityCli, launchArgs);

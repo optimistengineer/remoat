@@ -1468,15 +1468,30 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             return;
         }
 
-        // Project page navigation
-        if (data.startsWith(`${PROJECT_PAGE_PREFIX}:`)) {
-            const page = parseProjectPageId(data);
-            if (!isNaN(page)) {
-                const workspaces = workspaceService.scanWorkspaces();
-                const { text, keyboard } = buildProjectListUI(workspaces, page);
-                try { await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard }); } catch (e) { logger.debug('[editMsg] Telegram edit failed (expected for unmodified):', e); }
-            }
+        // Project folder navigation
+        if (data.startsWith('proj_nav:')) {
+            const nextPath = data.slice('proj_nav:'.length);
+            const workspaces = workspaceService.scanWorkspaces(nextPath);
+            const { text, keyboard } = buildProjectListUI(workspaces, 0, nextPath);
+            try { await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard }); } catch (e) { logger.debug('[editMsg] Telegram edit failed:', e); }
             await ctx.answerCallbackQuery();
+            return;
+        }
+
+        // Project folder pagination
+        if (data.startsWith('proj_pg:')) {
+            const parts = data.slice('proj_pg:'.length).split(':');
+            const page = parseInt(parts[0], 10) || 0;
+            const nextPath = parts.slice(1).join(':');
+            const workspaces = workspaceService.scanWorkspaces(nextPath);
+            const { text, keyboard } = buildProjectListUI(workspaces, page, nextPath);
+            try { await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard }); } catch (e) { logger.debug('[editMsg] Telegram edit failed:', e); }
+            await ctx.answerCallbackQuery();
+            return;
+        }
+
+        if (data === 'proj_err') {
+            await ctx.answerCallbackQuery({ text: '⚠️ Directory path is too deep to navigate via Telegram buttons.', show_alert: true });
             return;
         }
 

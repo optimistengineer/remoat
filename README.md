@@ -170,6 +170,20 @@ From source, you can also use the bundled launcher scripts:
 
 > Launch Antigravity first, then start the bot. It connects automatically.
 
+### Headless Environments
+
+If you are running Remoat on a headless Linux server or container, Antigravity requires a virtual display server (such as Xvfb) to launch.
+
+1. **Configure a Virtual Display**: Ensure a display server is running. For example, start a virtual framebuffer on display `:99`:
+   ```bash
+   Xvfb :99 -screen 0 1024x768x16 &
+   ```
+2. **Export the Display Variable**: Make sure the environment variable is set so child processes launched by Remoat can access the virtual display:
+   ```bash
+   export DISPLAY=:99
+   ```
+3. **Launch**: Relaunch or start Remoat as usual.
+
 ### Forum Topics (optional)
 
 For multi-project workflows, Remoat supports Telegram Forum Topics — each project gets its own topic thread.
@@ -205,6 +219,9 @@ remoat --quiet      errors only
 | `/model [name]` | Switch the LLM model (e.g. `gemini-2.5-pro`, `claude-opus-4-6`) |
 | `/mode` | Switch execution mode (`fast`, `plan`) |
 | `/stop` | Force-stop a running Antigravity task |
+| `/allow` | Approve the current file edit or plan proceed request |
+| `/deny` | Deny the current file edit or plan proceed request |
+| `/close` | Terminate the active Antigravity workspace via CDP |
 | | |
 | `/template` | List registered prompt templates with execute buttons |
 | `/template_add <name> <prompt>` | Register a new prompt template |

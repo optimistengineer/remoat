@@ -22,16 +22,21 @@ export class WorkspaceService {
     }
 
     /**
-     * Return a list of subdirectories in the base directory
+     * Return a list of subdirectories in the specified relative path
      */
-    public scanWorkspaces(): string[] {
+    public scanWorkspaces(relativePath: string = ''): string[] {
         this.ensureBaseDir();
+        const absolutePath = this.validatePath(relativePath);
 
-        const entries = fs.readdirSync(this.baseDir, { withFileTypes: true });
-        return entries
-            .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
-            .map((entry) => entry.name)
-            .sort();
+        try {
+            const entries = fs.readdirSync(absolutePath, { withFileTypes: true });
+            return entries
+                .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.') && entry.name !== 'node_modules')
+                .map((entry) => entry.name)
+                .sort();
+        } catch {
+            return [];
+        }
     }
 
     /**
