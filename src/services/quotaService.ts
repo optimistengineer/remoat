@@ -27,8 +27,8 @@ export class QuotaService {
 
     private async getUnixProcessInfo(): Promise<{pid: number, csrf_token: string} | null> {
         try {
-            // macOS
-            const { stdout } = await execAsync('pgrep -fl language_server');
+            const cmd = process.platform === 'darwin' ? 'pgrep -fl language_server' : 'pgrep -fa language_server';
+            const { stdout } = await execAsync(cmd);
             const lines = stdout.split('\n');
             for (const line of lines) {
                 if (line.includes('--csrf_token')) {
@@ -50,8 +50,10 @@ export class QuotaService {
     private async getListeningPorts(pid: number): Promise<number[]> {
         const ports: number[] = [];
         try {
-            // macOS
-            const { stdout } = await execAsync(`lsof -nP -a -iTCP -sTCP:LISTEN -p ${pid}`);
+            const cmd = process.platform === 'darwin'
+                ? `lsof -nP -a -iTCP -sTCP:LISTEN -p ${pid}`
+                : `lsof -w -nP -a -iTCP -sTCP:LISTEN -p ${pid}`;
+            const { stdout } = await execAsync(cmd);
             const regex = new RegExp(`^\\S+\\s+${pid}\\s+.*?(?:TCP|UDP)\\s+(?:\\*|[\\d.]+|\\[[\\da-f:]+\\]):(\\d+)\\s+\\(LISTEN\\)`, 'gim');
             let match;
             while ((match = regex.exec(stdout)) !== null) {

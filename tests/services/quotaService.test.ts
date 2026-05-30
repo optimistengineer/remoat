@@ -33,7 +33,7 @@ describe('QuotaService', () => {
 
     beforeEach(() => {
         jest.clearAllMocks();
-        consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+        consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => { });
     });
 
     afterEach(() => {
@@ -55,11 +55,11 @@ describe('QuotaService', () => {
 
     it('fetches quota info and caches port discovery for the same PID/Token', async () => {
         mockExec.mockImplementation((cmd: string, cb: (err: Error | null, stdout: string, stderr: string) => void) => {
-            if (cmd.startsWith('pgrep -fl language_server')) {
+            if (cmd.includes('pgrep -f') && cmd.includes('language_server')) {
                 cb(null, '123 language_server --csrf_token abc-123\n', '');
                 return {} as any;
             }
-            if (cmd.startsWith('lsof -nP -a -iTCP -sTCP:LISTEN -p 123')) {
+            if (cmd.includes('lsof') && cmd.includes('-p 123')) {
                 cb(null, 'language_server 123 user 10u IPv4 0x0 0t0 TCP *:4444 (LISTEN)\n', '');
                 return {} as any;
             }
@@ -111,7 +111,7 @@ describe('QuotaService', () => {
         expect(second).toHaveLength(1);
 
         const executedCommands = mockExec.mock.calls.map((call) => call[0] as string);
-        const lsofCalls = executedCommands.filter((cmd) => cmd.startsWith('lsof -nP -a -iTCP -sTCP:LISTEN -p 123'));
+        const lsofCalls = executedCommands.filter((cmd) => cmd.includes('lsof') && cmd.includes('-p 123'));
         expect(lsofCalls).toHaveLength(1);
         expect(mockRequest).toHaveBeenCalledTimes(2);
         expect(mockRequest.mock.calls[0][0].port).toBe(4444);

@@ -1,4 +1,4 @@
-import { Bot, Context, InlineKeyboard, InputFile } from 'grammy';
+import { Bot, Context, InlineKeyboard, InputFile, Keyboard } from 'grammy';
 import Database from 'better-sqlite3';
 
 import { t } from '../utils/i18n';
@@ -906,6 +906,30 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
                     options: pending.options,
                 }).catch((e: any) => { logger.error('[autoQueue] dispatch failed:', e); });
             }
+
+            // Auto-update the reply keyboard with current quota when workspace becomes idle
+            (async () => {
+                try {
+                    const projectName = wsKey.startsWith('ws:') ? wsKey.slice(3) : null;
+                    const freshCdp = projectName ? bridge.pool.getConnected(projectName) : null;
+                    const activeCdp = freshCdp || getCurrentCdp(bridge);
+                    if (activeCdp && promptDispatcher.isBusy(channel, activeCdp)) {
+                        return;
+                    }
+                    const activeModel = await getActiveModelName(channel);
+                    const quotaObj = await getActiveModelQuotaInfo(activeModel);
+                    const activeProj = await getActiveProjectName(channel);
+                    const keyboard = buildPersistentKeyboard(activeModel, quotaObj?.text, activeProj);
+                    const quotaMsg = quotaObj ? ` · ${quotaObj.icon} ${quotaObj.text}` : '';
+                    await bridge.botApi!.sendMessage(channel.chatId, `🤖 Model: <b>${escapeHtml(activeModel)}</b>${quotaMsg}`, {
+                        parse_mode: 'HTML',
+                        message_thread_id: channel.threadId,
+                        reply_markup: keyboard,
+                    });
+                } catch (e) {
+                    logger.debug('[onTaskComplete] Failed to send quota keyboard update:', e);
+                }
+            })();
         },
     });
 
@@ -984,11 +1008,132 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             },
         });
 
+    const getActiveModelName = async (chOrCtx?: Context | TelegramChannel): Promise<string> => {
+        try {
+            let cdp: CdpService | null = null;
+            if (chOrCtx) {
+                let chatId: number | string | undefined;
+                let threadId: number | undefined;
+                if ('chat' in chOrCtx) {
+                    chatId = chOrCtx.chat?.id;
+                    threadId = chOrCtx.message?.message_thread_id ?? chOrCtx.callbackQuery?.message?.message_thread_id ?? undefined;
+                } else {
+                    chatId = chOrCtx.chatId;
+                    threadId = chOrCtx.threadId;
+                }
+                if (chatId) {
+                    const chKey = threadId ? `${chatId}:${threadId}` : String(chatId);
+                    const session = chatSessionRepo.findByChannelId(chKey);
+                    const binding = workspaceBindingRepo.findByChannelId(chKey);
+                    const workspaceName = session?.workspacePath ?? binding?.workspacePath;
+                    if (workspaceName) {
+                        const workspacePath = workspaceService.getWorkspacePath(workspaceName);
+                        cdp = bridge.pool.getConnected(workspacePath) || null;
+                    }
+                }
+            }
+            if (!cdp) {
+                cdp = getCurrentCdp(bridge);
+            }
+            if (cdp) {
+                const currentModel = await cdp.getCurrentModel();
+                if (currentModel) return currentModel;
+            }
+        } catch (e) {
+            logger.debug('[getActiveModelName] Failed to get model:', e);
+        }
+        return modelService.getCurrentModel();
+    };
+
+    const getActiveModelQuotaInfo = async (modelName: string): Promise<{ percent: number; icon: string; text: string } | null> => {
+        try {
+            const quotaData = await bridge.quota.fetchQuota();
+            const normalize = (s: string) => s.toLowerCase().replace(/[\s\-_]/g, '');
+            const nName = normalize(modelName);
+            const q = quotaData.find(q => {
+                const nLabel = normalize(q.label);
+                const nModel = normalize(q.model || '');
+                return nLabel === nName || nModel === nName
+                    || nName.includes(nLabel) || nLabel.includes(nName)
+                    || (nModel && (nName.includes(nModel) || nModel.includes(nName)));
+            });
+            if (q && q.quotaInfo) {
+                const rem = q.quotaInfo.remainingFraction;
+                if (rem !== undefined && rem !== null && !isNaN(rem)) {
+                    const percent = Math.round(rem * 100);
+                    let icon = '🟢';
+                    if (percent <= 20) icon = '🔴';
+                    else if (percent <= 50) icon = '🟡';
+                    const text = percent <= 0 ? 'Exhausted' : `${percent}%`;
+                    return { percent, icon, text };
+                }
+            }
+        } catch (e) {
+            logger.debug('[getActiveModelQuotaInfo] Failed to get quota:', e);
+        }
+        return null;
+    };
+
+    const getActiveProjectName = async (chOrCtx?: Context | TelegramChannel): Promise<string> => {
+        try {
+            if (chOrCtx) {
+                let chatId: number | string | undefined;
+                let threadId: number | undefined;
+                if ('chat' in chOrCtx) {
+                    chatId = chOrCtx.chat?.id;
+                    threadId = chOrCtx.message?.message_thread_id ?? chOrCtx.callbackQuery?.message?.message_thread_id ?? undefined;
+                } else {
+                    chatId = chOrCtx.chatId;
+                    threadId = chOrCtx.threadId;
+                }
+                if (chatId) {
+                    const chKey = threadId ? `${chatId}:${threadId}` : String(chatId);
+                    const session = chatSessionRepo.findByChannelId(chKey);
+                    const binding = workspaceBindingRepo.findByChannelId(chKey);
+                    const workspaceName = session?.workspacePath ?? binding?.workspacePath;
+                    if (workspaceName) {
+                        return bridge.pool.extractProjectName(workspaceName) || workspaceName;
+                    }
+                }
+            }
+            if (bridge.lastActiveWorkspace) {
+                return bridge.lastActiveWorkspace;
+            }
+            const activeNames = bridge.pool.getActiveWorkspaceNames();
+            if (activeNames.length > 0) {
+                return activeNames[0];
+            }
+        } catch (e) {
+            logger.debug('[getActiveProjectName] Failed to get project name:', e);
+        }
+        return 'None';
+    };
+
+    const buildPersistentKeyboard = (modelName: string, quotaStr?: string, projectName?: string) => {
+        const modelBtn = quotaStr ? `🤖 Model: ${modelName} (${quotaStr})` : `🤖 Model: ${modelName}`;
+        const projBtn = `📁 Project: ${projectName || 'None'}`;
+        return new Keyboard()
+            .text(modelBtn)
+            .text(projBtn)
+            .resized()
+            .persistent();
+    };
+
     const replyHtml = async (ctx: Context, text: string, keyboard?: InlineKeyboard) => {
-        await ctx.reply(text, {
-            parse_mode: 'HTML',
-            reply_markup: keyboard,
-        });
+        if (keyboard) {
+            await ctx.reply(text, {
+                parse_mode: 'HTML',
+                reply_markup: keyboard,
+            });
+        } else {
+            const activeModel = await getActiveModelName(ctx);
+            const quotaObj = await getActiveModelQuotaInfo(activeModel);
+            const activeProj = await getActiveProjectName(ctx);
+            await ctx.reply(text, {
+                parse_mode: 'HTML',
+                reply_markup: buildPersistentKeyboard(activeModel, quotaObj?.text, activeProj),
+            });
+        }
     };
 
     // /start command
@@ -1013,7 +1158,8 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             `/close — Terminate active Antigravity session\n\n` +
             `<b>⚙️ Settings</b>\n` +
             `/mode — Display and change execution mode\n` +
-            `/model — Display and change LLM model\n\n` +
+            `/model — Display and change LLM model\n` +
+            `/quota — Check model usage quota\n\n` +
             `<b>📁 Projects</b>\n` +
             `/project — Display project list\n\n` +
             `<b>📝 Templates</b>\n` +
@@ -1048,14 +1194,41 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             const cdp = getCdp();
             if (!cdp) { await ctx.reply('Not connected to CDP. Send a message first to connect.'); return; }
             const res = await cdp.setUiModel(modelName);
-            if (res.ok) { await ctx.reply(`Model changed to <b>${escapeHtml(res.model || modelName)}</b>.`, { parse_mode: 'HTML' }); }
-            else { await ctx.reply(res.error || 'Failed to change model.'); }
+            if (res.ok) {
+                const updatedModel = res.model || modelName;
+                const quotaObj = await getActiveModelQuotaInfo(updatedModel);
+                const activeProj = await getActiveProjectName(ctx);
+                await ctx.reply(`Model changed to <b>${escapeHtml(updatedModel)}</b>.`, {
+                    parse_mode: 'HTML',
+                    reply_markup: buildPersistentKeyboard(updatedModel, quotaObj?.text, activeProj),
+                });
+            } else {
+                await ctx.reply(res.error || 'Failed to change model.');
+            }
         } else {
             await sendModelsUI(
                 async (text, keyboard) => { await replyHtml(ctx, text, keyboard); },
                 { getCurrentCdp: getCdp, fetchQuota: async () => bridge.quota.fetchQuota() },
             );
         }
+    });
+
+    // /quota command
+    bot.command('quota', async (ctx) => {
+        const ch = getChannel(ctx);
+        const resolved = await resolveWorkspaceAndCdp(ch);
+        const getCdp = (): CdpService | null => (resolved.ok ? resolved.cdp : null) ?? getCurrentCdp(bridge);
+        const cdp = getCdp();
+        if (!cdp) {
+            await ctx.reply('Not connected to CDP. Send a message first to connect.');
+            return;
+        }
+        const payload = await buildModelsUI(cdp, async () => bridge.quota.fetchQuota());
+        if (!payload) {
+            await ctx.reply('Failed to retrieve model list from Antigravity.');
+            return;
+        }
+        await replyHtml(ctx, payload.text);
     });
 
     // /template command
@@ -1373,6 +1546,13 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
                 const payload = await buildModelsUI(cdp, () => bridge.quota.fetchQuota());
                 if (payload) try { await ctx.editMessageText(payload.text, { parse_mode: 'HTML', reply_markup: payload.keyboard }); } catch (e) { logger.debug('[editMsg] Telegram edit failed (expected for unmodified):', e); }
                 await ctx.answerCallbackQuery({ text: `Model: ${res.model}` });
+                const updatedModel = res.model || modelName;
+                const quotaObj = await getActiveModelQuotaInfo(updatedModel);
+                const activeProj = await getActiveProjectName(ctx);
+                await ctx.reply(`Model changed to <b>${escapeHtml(updatedModel)}</b>.`, {
+                    parse_mode: 'HTML',
+                    reply_markup: buildPersistentKeyboard(updatedModel, quotaObj?.text, activeProj),
+                });
             } else {
                 await ctx.answerCallbackQuery({ text: res.error || 'Failed to change model.' });
             }
@@ -1386,6 +1566,13 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             const payload = await buildModelsUI(cdp, () => bridge.quota.fetchQuota());
             if (payload) try { await ctx.editMessageText(payload.text, { parse_mode: 'HTML', reply_markup: payload.keyboard }); } catch (e) { logger.debug('[editMsg] Telegram edit failed (expected for unmodified):', e); }
             await ctx.answerCallbackQuery({ text: 'Refreshed' });
+            const activeModel = await getActiveModelName(ctx);
+            const quotaObj = await getActiveModelQuotaInfo(activeModel);
+            const activeProj = await getActiveProjectName(ctx);
+            await ctx.reply(`Active model refreshed: <b>${escapeHtml(activeModel)}</b>`, {
+                parse_mode: 'HTML',
+                reply_markup: buildPersistentKeyboard(activeModel, quotaObj?.text, activeProj),
+            });
             return;
         }
 
@@ -1443,10 +1630,17 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
 
                     // Send welcome message in the new topic
                     const fullPath = workspaceService.getWorkspacePath(workspacePath);
+                    const activeModel = await getActiveModelName(ch);
+                    const quotaObj = await getActiveModelQuotaInfo(activeModel);
+                    const activeProj = bridge.pool.extractProjectName(workspacePath) || workspacePath;
                     await bot.api.sendMessage(
                         ch.chatId,
                         `<b>📁 Project Selected</b>\n\n✅ <b>${escapeHtml(workspacePath)}</b>\n<code>${escapeHtml(fullPath)}</code>\n\nSend messages here to interact with this project.`,
-                        { parse_mode: 'HTML', message_thread_id: topicId },
+                        {
+                            parse_mode: 'HTML',
+                            message_thread_id: topicId,
+                            reply_markup: buildPersistentKeyboard(activeModel, quotaObj?.text, activeProj),
+                        },
                     );
                     workspaceBindingRepo.upsert({ channelId: key, workspacePath, guildId });
                     await ctx.answerCallbackQuery({ text: `Topic created for: ${workspacePath}` });
@@ -1464,6 +1658,13 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
                 `<b>📁 Project Selected</b>\n\n✅ <b>${escapeHtml(workspacePath)}</b>\n<code>${escapeHtml(fullPath)}</code>\n\nSend messages here to interact with this project.`,
                 { parse_mode: 'HTML' },
             );
+            const activeModel = await getActiveModelName(ctx);
+            const quotaObj = await getActiveModelQuotaInfo(activeModel);
+            const activeProj = bridge.pool.extractProjectName(workspacePath) || workspacePath;
+            await ctx.reply(`Active project set to <b>${escapeHtml(activeProj)}</b>`, {
+                parse_mode: 'HTML',
+                reply_markup: buildPersistentKeyboard(activeModel, quotaObj?.text, activeProj),
+            });
             await ctx.answerCallbackQuery({ text: `Selected: ${workspacePath}` });
             return;
         }
@@ -1820,16 +2021,34 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
         await ctx.answerCallbackQuery();
     });
 
-    // =============================================================================
-    // Text message handler (main chat flow)
-    // =============================================================================
-
-    bot.on('message:text', async (ctx) => {
+bot.on('message:text', async (ctx) => {
         const ch = getChannel(ctx);
         const key = channelKey(ch);
         const text = ctx.message.text.trim();
 
         if (!text) return;
+
+        // Model button click interception (behaves as /model command)
+        if (text.startsWith('🤖 Model:')) {
+            const getCdp = async (): Promise<CdpService | null> => {
+                const resolved = await resolveWorkspaceAndCdp(ch);
+                return (resolved.ok ? resolved.cdp : null) ?? getCurrentCdp(bridge);
+            };
+            const cdp = await getCdp();
+            await sendModelsUI(
+                async (text, keyboard) => { await replyHtml(ctx, text, keyboard); },
+                { getCurrentCdp: () => cdp, fetchQuota: async () => bridge.quota.fetchQuota() },
+            );
+            return;
+        }
+
+        // Project button click interception (behaves as /project command)
+        if (text.startsWith('📁 Project:')) {
+            const workspaces = workspaceService.scanWorkspaces();
+            const { text: uiText, keyboard } = buildProjectListUI(workspaces, 0);
+            await replyHtml(ctx, uiText, keyboard);
+            return;
+        }
 
         // Plan edit interception
         const pendingPlanEdit = planEditPendingChannels.get(key);
