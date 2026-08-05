@@ -61,6 +61,35 @@ describe('ScreenshotService - screenshot feature (Step 8)', () => {
     });
 
     // ──────────────────────────────────────────────────────
+    // Test 2b: The feed is pinned to its bottom before capturing (issue #4)
+    // ──────────────────────────────────────────────────────
+    it('pins the conversation feed to the bottom before capturing', async () => {
+        mockCdpService.call.mockResolvedValue({ data: dummyBase64 });
+        mockCdpService.scrollConversationToBottom.mockResolvedValue(true);
+
+        screenshotService = new ScreenshotService({ cdpService: mockCdpService });
+        const result = await screenshotService.capture();
+
+        expect(result.success).toBe(true);
+        expect(mockCdpService.scrollConversationToBottom).toHaveBeenCalledTimes(1);
+        // Scroll must happen BEFORE the capture, or it cannot affect the image.
+        const scrollOrder = mockCdpService.scrollConversationToBottom.mock.invocationCallOrder[0];
+        const captureOrder = mockCdpService.call.mock.invocationCallOrder[0];
+        expect(scrollOrder).toBeLessThan(captureOrder);
+    });
+
+    it('still captures when no scrollable feed is found', async () => {
+        mockCdpService.call.mockResolvedValue({ data: dummyBase64 });
+        mockCdpService.scrollConversationToBottom.mockResolvedValue(false);
+
+        screenshotService = new ScreenshotService({ cdpService: mockCdpService });
+        const result = await screenshotService.capture();
+
+        expect(result.success).toBe(true);
+        expect(result.buffer).toBeInstanceOf(Buffer);
+    });
+
+    // ──────────────────────────────────────────────────────
     // Test 3: JPEG format can be specified
     // ──────────────────────────────────────────────────────
     it('captures with JPEG format specified', async () => {

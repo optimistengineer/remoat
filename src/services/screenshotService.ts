@@ -55,6 +55,14 @@ export class ScreenshotService {
      */
     async capture(options: CaptureOptions = {}): Promise<CaptureResult> {
         try {
+            // Pin the conversation feed to its latest message first (issue #4):
+            // without this the capture shows whatever stale scroll position the
+            // feed was left at. Best-effort — scrollConversationToBottom never throws.
+            if (await this.cdpService.scrollConversationToBottom()) {
+                // Give the renderer a moment to repaint at the new position
+                await new Promise(r => setTimeout(r, 150));
+            }
+
             const params: Record<string, any> = {
                 format: options.format ?? 'png',
             };

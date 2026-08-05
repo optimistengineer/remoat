@@ -10,7 +10,6 @@ describe('CdpService - Image Transfer', () => {
     const testPort = 19224;
     const fakeWsUrl = `ws://127.0.0.1:${testPort}/devtools/page/test-id`;
     let receivedMessages: any[] = [];
-    let evaluateCalls = 0;
 
     beforeAll((done) => {
         mockHttpServer = http.createServer((req, res) => {
@@ -34,7 +33,6 @@ describe('CdpService - Image Transfer', () => {
         mockWss.on('connection', (ws) => {
             serverSocket = ws;
             receivedMessages = [];
-            evaluateCalls = 0;
 
             ws.on('message', (message) => {
                 const req = JSON.parse(message.toString());
@@ -57,9 +55,14 @@ describe('CdpService - Image Transfer', () => {
                 }
 
                 if (req.method === 'Runtime.evaluate') {
-                    evaluateCalls += 1;
+                    const expression: string = req.params.expression || '';
 
-                    if (evaluateCalls === 1) {
+                    // Dispatch on the expression content, NOT on a call ordinal:
+                    // the injection path gained a focus-guard evaluate in the
+                    // Antigravity v2 fix, and an ordinal-keyed mock silently
+                    // mis-answers the next script when that happens again.
+                    if (expression.includes('data-remoat-chat-input')) {
+                        // focusChatInput() tier probe
                         ws.send(JSON.stringify({
                             id: req.id,
                             result: { result: { value: { ok: true } } },
@@ -67,7 +70,17 @@ describe('CdpService - Image Transfer', () => {
                         return;
                     }
 
-                    if (evaluateCalls === 2) {
+                    if (expression.includes('document.activeElement')) {
+                        // verifyChatInputFocused() negative focus guard
+                        ws.send(JSON.stringify({
+                            id: req.id,
+                            result: { result: { value: true } },
+                        }));
+                        return;
+                    }
+
+                    if (expression.includes('input[type="file"]')) {
+                        // attachImageFiles() upload-input locator
                         ws.send(JSON.stringify({
                             id: req.id,
                             result: { result: { value: { ok: true, token: 'agclaw-token' } } },
@@ -75,7 +88,8 @@ describe('CdpService - Image Transfer', () => {
                         return;
                     }
 
-                    if (evaluateCalls === 3) {
+                    if (expression.includes("removeAttribute('data-agclaw-upload-token')")) {
+                        // attachImageFiles() cleanup script
                         ws.send(JSON.stringify({
                             id: req.id,
                             result: { result: { value: { ok: true } } },
@@ -191,7 +205,6 @@ describe('CdpService - Image Transfer', () => {
     it('extracts image data from the latest response', async () => {
         await service.connect();
         await new Promise(r => setTimeout(r, 100));
-        evaluateCalls = 3;
 
         const images = await service.extractLatestResponseImages();
         expect(images).toHaveLength(1);

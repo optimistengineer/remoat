@@ -1,6 +1,17 @@
-import { CdpService } from '../../src/services/cdpService';
+import {
+    CdpService,
+    CHAT_INPUT_CANDIDATES,
+    CHAT_INPUT_EXCLUDE_ALWAYS,
+} from '../../src/services/cdpService';
 import * as http from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
+
+/**
+ * Map a focus-script expression back to the ladder tier that produced it.
+ * Returns -1 for any other Runtime.evaluate expression (e.g. the focus guard).
+ */
+const tierOf = (expression: string): number =>
+    CHAT_INPUT_CANDIDATES.findIndex((sel) => expression.includes(`const SEL = ${JSON.stringify(sel)};`));
 
 /**
  * Step 5: Message Injection TDD Tests
@@ -22,7 +33,9 @@ describe('CdpService - Message Injection (Step 5)', () => {
 
     // Store sent/received messages per test
     let receivedMessages: any[] = [];
-    let evaluateResponder: ((req: any) => { ok: boolean; method?: string; error?: string }) | null = null;
+    // May return a bare boolean: the focus guard's expression evaluates to
+    // true/false rather than an { ok } object.
+    let evaluateResponder: ((req: any) => { ok: boolean; method?: string; error?: string } | boolean) | null = null;
 
     // Mock context configuration
     const mockContexts = [
@@ -158,7 +171,181 @@ describe('CdpService - Message Injection (Step 5)', () => {
 
         const result = await service.injectMessage('失敗するメッセージ');
         expect(result.ok).toBe(false);
-        expect(result.error).toBeDefined();
+        // Exact string: injectMessage/injectMessageWithImageFiles surface it to users.
+        expect(result.error).toBe('Chat input field not found');
+    });
+
+    // ---------------------------------------------------------
+    // Test 3b: Tier ladder ordering (tiers OUTER, contexts INNER)
+    // ---------------------------------------------------------
+    it('walks the selector tiers in order, trying every context per tier', async () => {
+        await service.connect();
+        await new Promise(r => setTimeout(r, 100));
+        receivedMessages = [];
+
+        evaluateResponder = () => ({ ok: false, error: 'No editor found' });
+
+        await service.injectMessage('総当たりテスト');
+
+        const expressions = receivedMessages
+            .filter(m => m.method === 'Runtime.evaluate')
+            .map(m => m.params.expression as string);
+
+        // Every emitted focus expression carries the always-exclusion list.
+        for (const expression of expressions) {
+            expect(expression).toContain(JSON.stringify(CHAT_INPUT_EXCLUDE_ALWAYS));
+        }
+
+        const tiers = expressions.map(tierOf);
+        expect(tiers).not.toContain(-1);
+
+        // Tiers OUTER, contexts INNER: the tier index never decreases, and every
+        // tier is attempted in all three contexts before the next tier starts.
+        expect(tiers[0]).toBe(0);
+        for (let i = 1; i < tiers.length; i++) {
+            expect(tiers[i]).toBeGreaterThanOrEqual(tiers[i - 1]);
+        }
+        expect(tiers).toHaveLength(CHAT_INPUT_CANDIDATES.length * mockContexts.length);
+        expect(new Set(tiers).size).toBe(CHAT_INPUT_CANDIDATES.length);
+
+        // The Antigravity v2 combobox tier must be evaluated strictly before the
+        // broad `div[contenteditable="true"]` fallback ever gets a chance.
+        const firstCombobox = expressions.findIndex(e => e.includes('role=\\"combobox\\"'));
+        const firstBareFallback = expressions.findIndex(
+            e => e.includes(`const SEL = ${JSON.stringify('div[contenteditable="true"]')};`),
+        );
+        expect(firstCombobox).toBeGreaterThanOrEqual(0);
+        expect(firstBareFallback).toBeGreaterThan(firstCombobox);
+    });
+
+    // ---------------------------------------------------------
+    // Test 3c-2: Guard rejects once, ladder resumes, send SUCCEEDS at a later tier
+    // ---------------------------------------------------------
+    it('recovers when the focus guard rejects one tier but a later tier verifies', async () => {
+        await service.connect();
+        await new Promise(r => setTimeout(r, 100));
+        receivedMessages = [];
+
+        let guardProbes = 0;
+        evaluateResponder = (req) => {
+            const expression = req.params.expression as string;
+            if (expression.includes('document.activeElement')) {
+                guardProbes++;
+                return guardProbes > 1; // reject the first verification only
+            }
+            if (expression.includes('scrollTop')) return { ok: true };
+            return { ok: true, method: 'focus' }; // every focus tier succeeds
+        };
+
+        const result = await service.injectMessage('リトライ成功テスト');
+
+        expect(result.ok).toBe(true);
+        expect(receivedMessages.map(m => m.method)).toContain('Input.insertText');
+
+        // The winning focus attempt came from a LATER tier than the rejected one.
+        const focusTiers = receivedMessages
+            .filter(m => m.method === 'Runtime.evaluate')
+            .map(m => m.params.expression as string)
+            .filter(e => e.includes('data-remoat-chat-input'))
+            .map(tierOf);
+        expect(focusTiers).toEqual([0, 1]);
+    });
+
+    // ---------------------------------------------------------
+    // Test 3d: The feed is pinned to the bottom after a successful send (issue #4)
+    // ---------------------------------------------------------
+    it('pins the conversation feed to the bottom after a successful send', async () => {
+        await service.connect();
+        await new Promise(r => setTimeout(r, 100));
+        receivedMessages = [];
+
+        evaluateResponder = (req) => {
+            const contextId = req.params.contextId;
+            if (contextId === 2) return { ok: true, method: 'focus' };
+            return { ok: false, error: 'No editor found' };
+        };
+
+        const result = await service.injectMessage('スクロールテスト');
+        expect(result.ok).toBe(true);
+
+        const enterIdx = receivedMessages.findIndex(
+            m => m.method === 'Input.dispatchKeyEvent' && m.params.key === 'Enter',
+        );
+        const scrollIdx = receivedMessages.findIndex(
+            m => m.method === 'Runtime.evaluate' && (m.params.expression as string).includes('scrollTop'),
+        );
+        expect(enterIdx).toBeGreaterThanOrEqual(0);
+        // The scroll runs AFTER the Enter keypress, in the composer's context.
+        expect(scrollIdx).toBeGreaterThan(enterIdx);
+        expect(receivedMessages[scrollIdx].params.contextId).toBe(2);
+    });
+
+    // ---------------------------------------------------------
+    // Test 3e: Scroll falls back to other contexts when the composer's has no feed
+    // ---------------------------------------------------------
+    it('falls back to other contexts when the composer context has no conversation root', async () => {
+        await service.connect();
+        await new Promise(r => setTimeout(r, 100));
+        receivedMessages = [];
+
+        evaluateResponder = (req) => {
+            const expression = req.params.expression as string;
+            if (expression.includes('scrollTop')) {
+                // The composer's context (2) hosts no feed; context 3 does.
+                return req.params.contextId === 3
+                    ? { ok: true }
+                    : { ok: false, error: 'No conversation root found' };
+            }
+            if (req.params.contextId === 2) return { ok: true, method: 'focus' };
+            return { ok: false, error: 'No editor found' };
+        };
+
+        const result = await service.injectMessage('フォールバックスクロール');
+        expect(result.ok).toBe(true);
+
+        const scrollContexts = receivedMessages
+            .filter(m => m.method === 'Runtime.evaluate' && (m.params.expression as string).includes('scrollTop'))
+            .map(m => m.params.contextId);
+        // Preferred (composer) context first, then the fallback that succeeded.
+        expect(scrollContexts[0]).toBe(2);
+        expect(scrollContexts).toContain(3);
+    });
+
+    // ---------------------------------------------------------
+    // Test 3c: Focus-guard rejection resumes the ladder, then fails closed
+    // ---------------------------------------------------------
+    it('resumes the tier ladder when the focus guard rejects, and fails closed once exhausted', async () => {
+        await service.connect();
+        await new Promise(r => setTimeout(r, 100));
+        receivedMessages = [];
+
+        evaluateResponder = (req) => {
+            const expression = req.params.expression as string;
+            // Every focus tier "succeeds", but the negative guard (which probes
+            // document.activeElement) always rejects what got focused.
+            if (expression.includes('document.activeElement')) return false;
+            return { ok: true, method: 'focus' };
+        };
+
+        const result = await service.injectMessage('ガード拒否テスト');
+
+        expect(result.ok).toBe(false);
+        // Exact string: surfaced to users by injectMessage/injectMessageWithImageFiles.
+        expect(result.error).toBe('Chat input focus verification failed');
+
+        // Destructive input must never have been dispatched.
+        const methods = receivedMessages.map(m => m.method);
+        expect(methods).not.toContain('Input.insertText');
+        expect(methods).not.toContain('Input.dispatchKeyEvent');
+
+        // The ladder resumed past the rejected tier instead of failing terminally:
+        // every tier was offered before giving up.
+        const focusTiers = receivedMessages
+            .filter(m => m.method === 'Runtime.evaluate')
+            .map(m => m.params.expression as string)
+            .filter(e => e.includes('data-remoat-chat-input'))
+            .map(tierOf);
+        expect(new Set(focusTiers).size).toBe(CHAT_INPUT_CANDIDATES.length);
     });
 
     // ---------------------------------------------------------
@@ -182,10 +369,23 @@ describe('CdpService - Message Injection (Step 5)', () => {
         const evaluateCalls = receivedMessages.filter(m => m.method === 'Runtime.evaluate');
         expect(evaluateCalls.length).toBeGreaterThan(0);
 
-        // Verify that the focusScript was executed
+        // Verify that the focusScript was executed, starting at the most specific tier
         const firstCall = evaluateCalls[0];
-        expect(firstCall.params.expression).toContain('editor.focus()');
+        expect(firstCall.params.expression).toContain('.focus()');
+        expect(firstCall.params.expression).toContain(JSON.stringify(CHAT_INPUT_EXCLUDE_ALWAYS));
+        expect(tierOf(firstCall.params.expression)).toBe(0);
         expect(firstCall.params.returnByValue).toBe(true);
+
+        // The v2 combobox tier is always attempted before the bare contenteditable fallback.
+        const focusExpressions = evaluateCalls
+            .map((c) => c.params.expression as string)
+            .filter((e) => tierOf(e) >= 0);
+        const firstCombobox = focusExpressions.findIndex((e) => e.includes('role=\\"combobox\\"'));
+        const firstBareFallback = focusExpressions.findIndex(
+            (e) => e.includes(`const SEL = ${JSON.stringify('div[contenteditable="true"]')};`),
+        );
+        expect(firstCombobox).toBe(0);
+        expect(firstBareFallback === -1 || firstBareFallback > firstCombobox).toBe(true);
 
         // Verify that text is sent via Input.insertText
         const insertTextCalls = receivedMessages.filter(m => m.method === 'Input.insertText');

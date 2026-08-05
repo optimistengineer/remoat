@@ -5,7 +5,13 @@ import * as path from 'path';
 import { execFileSync } from 'child_process';
 import { CDP_PORTS } from '../../utils/cdpPorts';
 import { ConfigLoader } from '../../utils/configLoader';
-import { getAntigravityCdpHint } from '../../utils/pathUtils';
+import {
+    extractProjectNameFromPath,
+    findMacAppBundlePath,
+    getAntigravityCdpHint,
+    getAntigravityCliCandidates,
+    getAntigravityCliPath,
+} from '../../utils/pathUtils';
 import { COLORS } from '../../utils/logger';
 
 const ok = (msg: string) => console.log(`  ${COLORS.green}[OK]${COLORS.reset} ${msg}`);
@@ -142,15 +148,55 @@ export async function doctorAction(): Promise<void> {
                 fail(`ANTIGRAVITY_PATH set but not found: ${antigravityPath}`);
                 allOk = false;
             }
-        } else if (fs.existsSync('/Applications/Antigravity.app')) {
-            ok('Antigravity.app found in /Applications');
         } else {
-            warn('Antigravity.app not found in /Applications');
-            hint('Install Antigravity, or set ANTIGRAVITY_PATH in .env');
+            // v1 ships "Antigravity.app", v2 may ship "Antigravity IDE.app".
+            const bundle = findMacAppBundlePath();
+            if (bundle) {
+                ok(`${extractProjectNameFromPath(bundle)} found: ${bundle}`);
+            } else {
+                warn('Antigravity.app / "Antigravity IDE.app" not found in /Applications or ~/Applications');
+                hint('Install Antigravity, or set ANTIGRAVITY_PATH in .env');
+            }
         }
     }
 
-    // 7. CDP port check
+    // 7. Resolved Antigravity executable (Windows/Linux only)
+    //
+    // Deliberately skipped in two cases where fs.existsSync() cannot produce a
+    // truthful answer and would emit a false "not found":
+    //   a) macOS — the supported launcher is `open -a <bundle>` (openMacOS), not a
+    //      CLI binary. Antigravity ships app.asar with no Contents/Resources/app/bin,
+    //      so the probed CLI paths never exist even on a perfectly working install.
+    //      Check 6 above already covers macOS completely (bundle + ANTIGRAVITY_PATH).
+    //   b) A bare command name with no path separator (Linux's 'antigravity',
+    //      Windows' 'Antigravity.exe' fallback) means "resolve via PATH at spawn
+    //      time". existsSync() would resolve it against process.cwd() and always
+    //      report false.
+    // Reporting a false negative here is actively harmful: it pushes users to set
+    // ANTIGRAVITY_PATH, which makes check 6 hard-fail on any typo and makes
+    // openMacOS() take the spawn() branch instead of the `open -a` branch that works.
+    const cli = getAntigravityCliPath();
+    const cliIsPath = cli.includes('/') || cli.includes('\\');
+    if (platform !== 'darwin' && cliIsPath) {
+        if (fs.existsSync(cli)) {
+            ok(`Antigravity executable resolved: ${cli}`);
+        } else if (process.env.ANTIGRAVITY_PATH) {
+            // The override is returned verbatim by getAntigravityCliPath and is
+            // never existence-checked, so the candidate list was never probed —
+            // suggesting "install in a standard location" would not help here.
+            warn(`ANTIGRAVITY_PATH set but not found: ${cli}`);
+            hint('Fix or remove ANTIGRAVITY_PATH in .env.');
+        } else {
+            warn(`Antigravity executable not found: ${cli}`);
+            hint('Set ANTIGRAVITY_PATH in .env, or install Antigravity in a standard location.');
+            hint('Probed the following paths:');
+            for (const candidate of getAntigravityCliCandidates()) {
+                hint(`  ${candidate}`);
+            }
+        }
+    }
+
+    // 8. CDP port check
     console.log(`\n  ${COLORS.dim}Checking CDP ports...${COLORS.reset}`);
     let cdpOk = false;
     for (const port of CDP_PORTS) {

@@ -313,10 +313,20 @@ The selectors assume Antigravity's DOM follows this approximate structure:
   |     +-- ...
   |
   +-- conversation turn N (newest, DOM index N-1)
-        +-- .rendered-markdown  (current response text)  <-- RESPONSE_TEXT picks this
-        +-- .leading-relaxed    (current activity)        <-- PROCESS_LOGS picks these
-        +-- .flex.flex-col      (current tool output)     <-- PROCESS_LOGS picks these
+  |     +-- .rendered-markdown  (current response text)  <-- RESPONSE_TEXT picks this
+  |     +-- .leading-relaxed    (current activity)        <-- PROCESS_LOGS picks these
+  |     +-- .flex.flex-col      (current tool output)     <-- PROCESS_LOGS picks these
+  |
+  +-- composer  div[role=combobox|textbox][contenteditable=true]
+        +-- [data-tooltip-id="input-send-button-cancel-tooltip"]  <-- STOP_BUTTON picks this
 ```
+
+> The composer element itself is the **write** target and belongs to `cdpService.ts`, not to
+> `responseMonitor.ts` — see
+> [Chat Input Field](ANTIGRAVITY_DOM_SELECTORS.md#12-chat-input-field-message-injection-target).
+> Its ARIA role changed from `textbox` (v1) to `combobox` (Antigravity IDE v2); the stop button lives
+> on the same composer component, so if completion detection ever reports "done" with an empty
+> response, re-verify `[data-tooltip-id="input-send-button-cancel-tooltip"]` first.
 
 **Key invariant:** DOM order is chronological (index 0 = oldest).
 The reverse iteration in RESPONSE_TEXT ensures the newest turn's response wins.

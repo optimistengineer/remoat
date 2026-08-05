@@ -29,7 +29,7 @@ What happened instead? Include error messages or screenshots if relevant.
 - **OS:** (e.g. macOS 15, Ubuntu 24.04, Windows 11)
 - **Node.js:** (output of `node --version`)
 - **Remoat:** (output of `remoat --version`)
-- **Antigravity:** (version number)
+- **Antigravity:** Antigravity (v1) / Antigravity IDE (v2) + version — e.g. `Antigravity IDE 2.0.10`
 
 ## Logs
 

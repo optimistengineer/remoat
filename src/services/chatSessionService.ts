@@ -350,21 +350,48 @@ function buildActivateViaPastConversationsScript(title: string): string {
         };
         const findSearchInput = () => {
             const inputs = asArray(document.querySelectorAll('input, textarea, [role="combobox"], [role="searchbox"], [contenteditable="true"]'));
-            const strongPatterns = ['select a conversation', 'search conversation', 'search chats', 'search'];
+            // Conversation-specific labels. Only these may claim a "suspect"
+            // (composer-shaped or panel-hosted) element — a real Past Conversations
+            // search box carries one of them, the chat composer never does.
+            const conversationPatterns = ['select a conversation', 'search conversation', 'search chats'];
+            // Generic label, checked last and only for elements that are NOT suspect.
+            const strongPatterns = conversationPatterns.concat(['search']);
             const placeholders = [];
             for (const el of inputs) {
                 if (!isVisible(el)) continue;
+                // Hard exclusion: this is the element focusChatInput() just tagged as the
+                // chat composer. Typing here would write the conversation TITLE into the
+                // chat box and press Enter, sending it to the agent as a prompt.
+                if (el.getAttribute && el.getAttribute('data-remoat-chat-input') === '1') continue;
+                // Soft exclusion. Under Antigravity v2 the composer is a
+                // div[role="combobox"][contenteditable="true"] living inside
+                // #conversation / .antigravity-agent-side-panel, so it matches the union
+                // above for the first time. But the Past Conversations panel is opened
+                // from that same side panel and its search box may itself be a
+                // contenteditable combobox - so these shapes must only DEMOTE a
+                // candidate, never discard one that is explicitly labelled as the
+                // conversation search box.
+                const composerShaped = typeof el.matches === 'function'
+                    && el.matches('div[role="combobox"][contenteditable="true"], div[role="textbox"][contenteditable="true"]');
+                const inAgentPanel = typeof el.closest === 'function'
+                    && !!el.closest('#conversation, .antigravity-agent-side-panel');
+                const suspect = composerShaped || inAgentPanel;
                 const placeholder = normalize(el.getAttribute('placeholder') || '');
                 const ariaLabel = normalize(el.getAttribute('aria-label') || '');
                 const text = normalize(getLabelText(el));
                 const combined = [placeholder, ariaLabel, text].filter(Boolean).join(' ');
-                placeholders.push({ el, combined });
+                placeholders.push({ el, combined, suspect });
             }
             for (const p of strongPatterns) {
-                const found = placeholders.find((x) => x.combined.includes(p));
+                const conversationSpecific = conversationPatterns.indexOf(p) !== -1;
+                const found = placeholders.find((x) => x.combined.includes(p) && (conversationSpecific || !x.suspect));
                 if (found) return found.el;
             }
-            return placeholders[0]?.el || null;
+            // Only fall back to a non-suspect element that actually carries a
+            // placeholder/aria-label/label text. Returning null is safe: the caller
+            // degrades to clickByPatterns.
+            const labelled = placeholders.find((x) => x.combined && !x.suspect);
+            return labelled ? labelled.el : null;
         };
 
         return (async () => {

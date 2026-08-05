@@ -2,7 +2,14 @@
 
 Central reference for all CSS selectors and DOM structures used to interact with the Antigravity (Windsurf/Cascade) UI via CDP.
 
-> Verified against live Antigravity DOM. Selectors may change with Antigravity updates.
+> Verified against a live Antigravity DOM. Read-path selectors (sections 1–11) were verified against
+> **Antigravity v1.21.x** and re-checked on **Antigravity v2.0.x**. The write-path chat-input selector
+> (section 12) is documented for both **v1** (`role="textbox"`) and **v2** (`role="combobox"`);
+> the v2 tier ordering has not yet been confirmed against a live v2 instance — see the note in that
+> section for how to confirm it from a bug report. Selectors may change with any Antigravity update.
+
+> **Most load-bearing selector in the repo**: [§12 Chat Input Field](#12-chat-input-field-message-injection-target).
+> It is the only *write* target — every other selector in this document only reads.
 
 ---
 
@@ -274,6 +281,196 @@ Antigravity renders code blocks in a non-standard way.
 
 ---
 
+## 12. Chat Input Field (message injection target)
+
+The composer that remoat types into. **This is the only selector in this document that writes to the
+DOM**, and a wrong resolution is not a "message fails to send" bug — see [Data-loss hazard](#data-loss-hazard)
+below.
+
+**Defined in**: `cdpService.ts` (`CHAT_INPUT_CANDIDATES`, `CHAT_INPUT_EXCLUDE_ALWAYS`,
+`CHAT_INPUT_EXCLUDE_BROAD`, `buildFocusChatInputScript`) — **used by**: `focusChatInput()`,
+`injectMessage()`, `injectMessageWithImageFiles()`.
+
+### Version differences
+
+| Antigravity version | Composer element |
+|---------------------|------------------|
+| v1 (`Antigravity`) | `div[role="textbox"][contenteditable="true"]` |
+| v2 (`Antigravity IDE`) | `div[role="combobox"][contenteditable="true"]` |
+
+The `contenteditable="true"` attribute is stable across both; only the ARIA role changed. This is what
+broke message injection with `Chat input field not found` on v2 (issue #15).
+
+### Ordered candidate ladder
+
+Resolution is an **ordered tier ladder**, not a flat selector union. Tier 0 is tried first; the first
+tier that yields a visible, non-excluded match wins and **tiers are never merged**.
+
+| Tier | Selector | Targets |
+|------|----------|---------|
+| 0 | `.antigravity-agent-side-panel div[role="combobox"][contenteditable="true"]` | v2, panel-scoped |
+| 1 | `.antigravity-agent-side-panel div[role="textbox"][contenteditable="true"]` | v1, panel-scoped |
+| 2 | `.antigravity-agent-side-panel div[role="textbox"]` | v1 without `contenteditable` |
+| 3 | `#conversation div[role="combobox"][contenteditable="true"]` | v2, conversation-scoped |
+| 4 | `#conversation div[role="textbox"][contenteditable="true"]` | v1, conversation-scoped |
+| 5 | `#conversation div[role="textbox"]` | v1, conversation-scoped |
+| 6 | `.antigravity-agent-side-panel div[contenteditable="true"]` | either, role dropped |
+| 7 | `#conversation div[contenteditable="true"]` | either, role dropped |
+| 8 | `div[role="combobox"][contenteditable="true"]` | v2, **unscoped** |
+| 9 | `div[role="textbox"][contenteditable="true"]` | v1, **unscoped** |
+| 10 | `div[role="textbox"]:not(.xterm-helper-textarea)` | the legacy pre-v2 selector, kept verbatim |
+| 11 | `div[contenteditable="true"]` | last resort, gated by a positive label signal |
+
+`CHAT_INPUT_BROAD_TIER_START = 8` marks where tiers stop being scoped to the Antigravity panel.
+
+Notes:
+
+- **Every tier keeps the `div` tag qualifier.** VS Code's Quick Open, Settings select boxes, find
+  inputs, the explorer inline-rename box and the terminal find widget are all
+  `<input>`/`<select>`/`<textarea>`, so `div` excludes them for free. Do not drop it.
+- **Tier 10's `:not(.xterm-helper-textarea)` is a no-op** (xterm's helper is a `<textarea>`, not a
+  `div`). The *selector string* is retained verbatim, but tier 10 does **not** reproduce the exact
+  pre-v2 behaviour: like every tier it is additionally subject to `CHAT_INPUT_EXCLUDE_ALWAYS`, the
+  40×8 size gate, and (being ≥ `CHAT_INPUT_BROAD_TIER_START`) `CHAT_INPUT_EXCLUDE_BROAD`. When
+  triaging a v1-only regression, check those three deltas first.
+- **Tier 11 requires a positive signal**: the element's `aria-label` / `data-placeholder` /
+  `placeholder` must match `/chat|message|ask|plan|prompt/`. Without that gate, a bare
+  `div[contenteditable="true"]` matches far too much.
+- **Within a tier, the LAST visible match wins.** The v1 panel contains several textboxes and the
+  composer is the last one. This is a deliberately preserved behaviour, not an accident.
+
+### Exclusion lists (and why they are split)
+
+`CHAT_INPUT_EXCLUDE_ALWAYS` — applied to **every** tier via `el.closest(...)`:
+
+| Selector | Why |
+|----------|-----|
+| `.xterm` | Integrated terminal — typing here would run shell commands |
+| `.xterm-helper-textarea` | xterm's hidden a11y input |
+| `[aria-hidden="true"]` | Off-screen / unmounted React subtrees |
+| `.monaco-editor`, `.native-edit-context`, `.inputarea` | Embedded code editors — the data-loss target. The agent panel renders Monaco inline (code blocks, diff views), so these must be excluded even in panel-scoped tiers: a decoy after the composer would otherwise win via last-visible-match at tier 6/7 |
+
+`CHAT_INPUT_EXCLUDE_BROAD` — applied **only** to unscoped tiers (index >= `CHAT_INPUT_BROAD_TIER_START`):
+
+| Selector | Why |
+|----------|-----|
+| `.quick-input-widget`, `.monaco-inputbox`, `.monaco-findInput` | Quick Open, find/replace, input boxes |
+| `.suggest-widget`, `.monaco-list` | Autocomplete popups and the explorer inline-rename box |
+| `.interactive-input-part`, `.repl-input-wrapper` | Notebook / REPL cell inputs |
+| `.scm-editor`, `.comment-form` | SCM commit message box, review comment editors |
+| `[role="searchbox"]` | Search widgets |
+
+**Why the split**: the broad list contains workbench-level widgets (Quick Open, SCM box, find
+inputs) that render at the document root and can never appear inside the Antigravity panel, so the
+scoped tiers don't pay for them. The Monaco guards live in the always list because Monaco *can*
+appear inside the panel; this is safe because the composer is a Lexical-style contenteditable in
+both v1 and v2 (see the version table above), never a Monaco editor — if that ever changes, the
+`.monaco-editor` entry must move back to the broad list.
+
+### Resolution loop: tiers OUTER, execution contexts INNER
+
+`focusChatInput()` iterates **tiers on the outside and CDP execution contexts on the inside**:
+
+```
+for tier in 0..11:
+    for context in contexts:
+        Runtime.evaluate(buildFocusChatInputScript(tier), contextId=context)
+        if ok: return
+```
+
+A tier-0 hit in the third context beats a tier-8 hit in the first context. Inverting the loops "for
+efficiency" would let a webview or iframe execution context win with a low-specificity match before
+the real workbench context is ever tried at a higher tier. The happy path is 1–2 round-trips (tier 0
+hits). The 12 × N-contexts worst case only occurs on total failure and is bounded: each ladder scan
+has a 15 s budget (`FOCUS_LADDER_BUDGET_MS`) enforced at **tier boundaries only** — every tier that
+starts gets a full pass over the contexts, so a single timed-out evaluate (the per-call CDP timeout
+can equal or exceed the budget) cannot abort the ladder before the context holding the composer is
+probed. A budget abort fails with the distinct `Chat input resolution timed out`, and a context whose
+evaluate times out once is skipped for all remaining tiers.
+
+After a successful focus, a negative guard (`verifyChatInputFocused`) checks that
+`document.activeElement` is not a known-wrong widget (Monaco, xterm, quick input). On rejection the
+ladder **resumes at the next tier** (`focusChatInputVerified`) instead of failing terminally; only
+when the ladder is exhausted does injection fail with `Chat input focus verification failed`.
+
+### `data-remoat-chat-input` — a cross-service contract
+
+The winning element is tagged `data-remoat-chat-input="1"`, and any previous holder has the attribute
+removed first.
+
+This attribute is **not** decoration:
+
+- `cdpService.ts` writes it in `buildFocusChatInputScript`.
+- `chatSessionService.ts`'s `findSearchInput()` **skips** any element carrying it, because under v2
+  the composer newly satisfies that function's
+  `input, textarea, [role="combobox"], [role="searchbox"], [contenteditable="true"]` union. Without the
+  guard, the Past Conversations flow would type a conversation *title* into the chat box and press
+  Enter, sending it to the agent as a prompt.
+
+Changing or removing the attribute silently breaks that collision guard. `findSearchInput()` also
+carries two independent fallback guards (element shape, and an `#conversation` /
+`.antigravity-agent-side-panel` ancestor check) precisely because React re-renders can drop the
+attribute.
+
+### Data-loss hazard
+
+`injectMessage()` runs `clearInputField()` immediately after focusing, which dispatches
+**Cmd/Ctrl+A followed by Backspace** to whatever `document.activeElement` currently is, then
+`Input.insertText` types the Telegram message into it, then presses Enter. If the wrong element is
+focused, that sequence **wipes the user's open source file and types the Telegram message into it**.
+
+Two mitigations exist and must be kept:
+
+1. The ordered ladder above (specific before broad, scoped before unscoped).
+2. `verifyChatInputFocused()` — a **negative** guard that runs between focus and `clearInputField()`
+   and aborts with `Chat input focus verification failed` if `document.activeElement` is inside
+   `.monaco-editor`, `.xterm`, `.native-edit-context`, `.quick-input-widget` or `.monaco-inputbox`.
+   It is deliberately negative (reject known-wrong widgets) rather than positive (require the
+   `data-remoat-chat-input` tag), because a React re-render that drops the tag would otherwise break
+   every send. Evaluate failures are treated as a pass.
+
+### Diagnosing a future break
+
+`focusChatInput()` logs `Chat input matched tier N (<selector>) in context M` at debug level. Ask a
+reporter to run with `LOG_LEVEL=debug` and include that line: it tells you immediately whether the
+panel scoping still holds (tier 0–7) or whether resolution fell through to the unscoped tiers, which
+still work but with weaker guarantees. `Chat input not found after 12 selector tiers across N contexts`
+is logged at warn level when everything fails.
+
+Tests: `tests/services/cdpService.chatInputSelector.test.ts` (pure-DOM tier resolution),
+`tests/services/cdpService.injection.test.ts` (tier ordering over CDP),
+`tests/services/chatSessionService.searchInput.test.ts` (the collision guard).
+
+---
+
+## 13. Conversation Feed Scroll Container (auto-scroll, issue #4)
+
+**Defined in**: `cdpService.ts` (`buildScrollFeedToBottomScript`) — **used by**:
+`scrollConversationToBottom()`, called after `injectMessage()` /
+`injectMessageWithImageFiles()` send a prompt and by `ScreenshotService.capture()`
+before `Page.captureScreenshot`.
+
+There is no stable class or id on the scrollable feed element itself, so it is found
+structurally rather than by name:
+
+1. Root: `#conversation`, falling back to `.antigravity-agent-side-panel`.
+2. Within the first root that yields a hit: every element (root included) with
+   `scrollHeight > clientHeight + 4` **and** a computed `overflow-y` of
+   `auto`/`scroll`/`overlay`.
+3. The **tallest** such element (largest `scrollHeight`) is taken as the feed and
+   pinned via `scrollTop = scrollHeight`.
+
+Best-effort by design: `scrollConversationToBottom()` never throws and a miss is
+logged at debug level only — a stale scroll position is cosmetic. It is deliberately
+NOT called from `responseMonitor`'s 2-second poll loop: re-pinning on every poll
+would fight a user who scrolled up on purpose in the IDE.
+
+Tests: `tests/services/cdpService.scrollFeed.test.ts` (pure-DOM),
+`tests/services/cdpService.injection.test.ts` (runs after Enter, composer context),
+`tests/services/screenshotService.test.ts` (runs before capture).
+
+---
+
 ## Maintenance Notes
 
 ### When Antigravity updates its DOM
@@ -301,3 +498,4 @@ These can be safely removed if desired, as they never match and the higher-score
 
 - `[data-message-author-role="user"]` — Used in `userMessageDetector.ts` before fix. **Does not exist** in Antigravity DOM. Replaced with `[class*="bg-gray-500/15"][class*="rounded-lg"][class*="select-text"]` (commit `8285624`).
 - Single bubble query `[class*="bg-gray-500/15"][class*="rounded-lg"][class*="select-text"]` without parent filter — Matched parent wrapper containers containing multiple user messages, causing echo duplication and previous-prompt pickup bugs. Fixed by adding Strategy A (direct text element query) + Strategy B (parent filter).
+- `div[role="textbox"]:not(.xterm-helper-textarea)` — the chat input (message injection target) before **Antigravity IDE v2**. v2 changed the composer's ARIA role from `textbox` to `combobox` (it stays `contenteditable="true"`), so every message injection failed with `Chat input field not found`. Replaced by the ordered candidate ladder in [§12](#12-chat-input-field-message-injection-target), which covers both roles, scopes to the agent panel first, and excludes Monaco / terminal / quick-input widgets (issue #15). The old selector is retained verbatim as tier 10. A flat union such as `div[role="textbox"]:not(...), div[contenteditable="true"]:not(...)` was **rejected**: combined with "last visible match wins" it can select the open Monaco editor, and `clearInputField()` would then wipe the user's file.

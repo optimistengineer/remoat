@@ -164,11 +164,28 @@ From source, you can also use the bundled launcher scripts:
 
 | Platform | Method |
 |----------|--------|
-| macOS    | Double-click `start_antigravity_mac.command` (run `chmod +x` first time) |
-| Windows  | Double-click `start_antigravity_win.bat` |
-| Linux    | Set `ANTIGRAVITY_PATH=/path/to/antigravity` in `.env`, then `remoat open` |
+| macOS    | Double-click `start_antigravity_mac.command` (run `chmod +x` first time) — probes `Antigravity IDE.app` then `Antigravity.app` |
+| Windows  | Double-click `start_antigravity_win.bat` — probes `Antigravity IDE` then `Antigravity`, falls back to `PATH` |
+| Linux    | `remoat open` (probes `/usr/bin`, `/usr/local/bin`, `/opt`, `/snap`); set `ANTIGRAVITY_PATH=/path/to/antigravity` in `.env` for anything else |
 
 > Launch Antigravity first, then start the bot. It connects automatically.
+
+#### Antigravity v1 vs v2
+
+Antigravity IDE v2 renamed the Windows install folder and executable (note the **space**). Remoat
+supports both: it probes the v2 location first, then the v1 location, and uses the first one that
+actually exists — so a v1 install keeps working unchanged.
+
+| Platform | Probed, in order |
+|----------|------------------|
+| macOS    | `/Applications/Antigravity IDE.app`, `/Applications/Antigravity.app`, then the same two under `~/Applications` |
+| Windows  | `%LOCALAPPDATA%\Programs\Antigravity IDE\Antigravity IDE.exe`, `%LOCALAPPDATA%\Programs\Antigravity\Antigravity.exe`, the same two under `%ProgramFiles%` and `%ProgramFiles(x86)%`, then the `bin\antigravity.cmd` shims |
+| Linux    | `/usr/bin/antigravity`, `/usr/bin/antigravity-ide`, `/usr/local/bin/...`, `/opt/Antigravity/antigravity`, `/opt/Antigravity IDE/antigravity-ide`, `/snap/bin/antigravity` |
+
+`ANTIGRAVITY_PATH` always wins over all of the above. On macOS v2 (verified on 2.0.10) the `.app`
+bundle is still named `Antigravity.app` — the rename is Windows-only.
+
+Run `remoat doctor` to see exactly which path was resolved, and the full probed list if none was.
 
 ### Forum Topics (optional)
 
@@ -236,12 +253,44 @@ This checks your config, Node.js version, Xcode tools (macOS), Antigravity insta
 
 **`npm install` fails with `gyp ERR!` on macOS** — Install Xcode Command Line Tools: `xcode-select --install`
 
-**`remoat open` can't find Antigravity** — The app must be in `/Applications`. If you installed it elsewhere, set `ANTIGRAVITY_PATH` in your `.env` file or environment:
+**`remoat open` can't find Antigravity** — Standard install locations are probed automatically (see
+[Antigravity v1 vs v2](#antigravity-v1-vs-v2)); nothing has to live in `/Applications`. Run
+`remoat doctor` to see which path resolved and the full probed list. If your install is somewhere
+else, set `ANTIGRAVITY_PATH` in your `.env` file or environment:
 
 ```bash
-export ANTIGRAVITY_PATH=/path/to/Antigravity
+# macOS — normally NOT needed, see the note below
+export ANTIGRAVITY_PATH="/Applications/Antigravity.app/Contents/MacOS/Antigravity"
+# Windows (cmd)
+set ANTIGRAVITY_PATH=C:\Users\you\AppData\Local\Programs\Antigravity IDE\Antigravity IDE.exe
+# Linux
+export ANTIGRAVITY_PATH=/opt/applications/antigravity.AppImage
+
 remoat open
 ```
+
+> **macOS users: leave `ANTIGRAVITY_PATH` unset.** `remoat open` launches the app with `open -a`,
+> which locates the bundle through LaunchServices no matter where it lives, and the `Antigravity IDE`
+> rename is **Windows-only** — the macOS bundle is still `Antigravity.app` with a
+> `Contents/MacOS/Antigravity` binary. Setting `ANTIGRAVITY_PATH` switches `remoat open` to a
+> direct-binary launch, so a wrong value turns a working setup into `Failed to open …`.
+
+> **Paths with spaces**: quote the value when you export it in a shell, but do **not** quote it inside
+> `.env` — dotenv reads the value literally, and the surrounding quotes would become part of the path.
+> Correct `.env` line:
+> `ANTIGRAVITY_PATH=C:\Users\you\AppData\Local\Programs\Antigravity IDE\Antigravity IDE.exe`
+
+**`Chat input field not found` when sending a message** — This was the Antigravity IDE v2 symptom
+fixed in [#15](https://github.com/optimistengineer/remoat/issues/15) (the composer's ARIA role changed
+from `textbox` to `combobox`). If it reappears after an Antigravity update, run the bot with
+`LOG_LEVEL=debug` and include the `Chat input matched tier …` / `Chat input not found after …` line in
+your report — see [docs/ANTIGRAVITY_DOM_SELECTORS.md](docs/ANTIGRAVITY_DOM_SELECTORS.md#12-chat-input-field-message-injection-target).
+
+> **PowerShell**: `remoat doctor` prints the manual launch command in cmd syntax. For a detected v2
+> install that command starts with a quoted full path
+> (`"C:\Users\you\AppData\Local\Programs\Antigravity IDE\Antigravity IDE.exe" --remote-debugging-port=9222`),
+> which PowerShell parses as a string expression rather than a command. Prefix it with the call
+> operator: `& "C:\Users\you\AppData\Local\Programs\Antigravity IDE\Antigravity IDE.exe" --remote-debugging-port=9222`.
 
 **Bot not responding to messages** — Make sure Antigravity is running with CDP enabled (`remoat open`) before starting the bot. The bot will warn you on startup if no CDP ports are responding, but it continues running and auto-connects once Antigravity is available.
 

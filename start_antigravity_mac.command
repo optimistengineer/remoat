@@ -20,7 +20,24 @@ if [ -z "$SELECTED_PORT" ]; then
 fi
 
 echo "[INFO] Starting Antigravity on port $SELECTED_PORT..."
-open -a Antigravity --args --remote-debugging-port=$SELECTED_PORT
-echo "[OK] Launch complete! CDP port: $SELECTED_PORT"
-sleep 2
-exit
+# Antigravity v2 may install as "Antigravity IDE.app"; probe the same four
+# locations as remoat itself (pathUtils.getMacAppBundleCandidates), v2 first.
+APP="Antigravity"
+for bundle in "/Applications/Antigravity IDE.app" \
+              "/Applications/Antigravity.app" \
+              "$HOME/Applications/Antigravity IDE.app" \
+              "$HOME/Applications/Antigravity.app"; do
+    if [ -d "$bundle" ]; then
+        APP="$(basename "$bundle" .app)"
+        break
+    fi
+done
+if open -a "$APP" --args --remote-debugging-port=$SELECTED_PORT; then
+    echo "[OK] Launch complete! CDP port: $SELECTED_PORT"
+    sleep 2
+    exit 0
+else
+    echo "[ERROR] Failed to launch \"$APP\". Is Antigravity installed?"
+    read -p "Press Enter to close..."
+    exit 1
+fi

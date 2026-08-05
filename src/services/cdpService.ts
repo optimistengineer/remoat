@@ -4,7 +4,7 @@ import { EventEmitter } from 'events';
 import * as http from 'http';
 import * as net from 'net';
 import { spawn } from 'child_process';
-import { getAntigravityCliPath, extractProjectNameFromPath } from '../utils/pathUtils';
+import { getAntigravityCliPath, getAntigravityMacAppName, getAntigravityCliCandidates, extractProjectNameFromPath } from '../utils/pathUtils';
 import WebSocket from 'ws';
 
 export interface CdpServiceOptions {
@@ -46,10 +46,146 @@ export interface UiSyncResult {
     error?: string;
 }
 
+/**
+ * Ordered chat-input candidates, most specific first.
+ * Antigravity v1 composer: div[role="textbox"][contenteditable="true"]
+ * Antigravity v2 composer: div[role="combobox"][contenteditable="true"]
+ * focusChatInput() stops at the FIRST tier that yields a visible match and
+ * never merges tiers - see docs/ANTIGRAVITY_DOM_SELECTORS.md.
+ */
+export const CHAT_INPUT_CANDIDATES: readonly string[] = [
+    '.antigravity-agent-side-panel div[role="combobox"][contenteditable="true"]',
+    '.antigravity-agent-side-panel div[role="textbox"][contenteditable="true"]',
+    '.antigravity-agent-side-panel div[role="textbox"]',
+    '#conversation div[role="combobox"][contenteditable="true"]',
+    '#conversation div[role="textbox"][contenteditable="true"]',
+    '#conversation div[role="textbox"]',
+    '.antigravity-agent-side-panel div[contenteditable="true"]',
+    '#conversation div[contenteditable="true"]',
+    'div[role="combobox"][contenteditable="true"]',
+    'div[role="textbox"][contenteditable="true"]',
+    'div[role="textbox"]:not(.xterm-helper-textarea)',
+    'div[contenteditable="true"]',
+];
+
+/** Index at which tiers stop being scoped to the Antigravity panel. */
+export const CHAT_INPUT_BROAD_TIER_START = 8;
+
+/**
+ * Exclusion selector applied to EVERY chat-input tier: terminal widgets plus
+ * embedded code editors. The composer is a Lexical-style contenteditable and is
+ * never hosted inside Monaco, but the agent panel itself can render Monaco
+ * inline (code blocks, diff views), so these must be excluded even in the
+ * panel-scoped tiers.
+ */
+export const CHAT_INPUT_EXCLUDE_ALWAYS =
+    '.xterm, .xterm-helper-textarea, [aria-hidden="true"], .monaco-editor, .native-edit-context, .inputarea';
+
+/**
+ * Exclusion selector applied ONLY to unscoped tiers (index >=
+ * CHAT_INPUT_BROAD_TIER_START). These are workbench-level widgets (quick input,
+ * SCM box, find inputs) that render at the document root and can never appear
+ * inside the Antigravity panel, so the scoped tiers don't need them.
+ */
+export const CHAT_INPUT_EXCLUDE_BROAD =
+    '.quick-input-widget, .monaco-inputbox, .monaco-findInput, .suggest-widget, .monaco-list, .interactive-input-part, .repl-input-wrapper, .scm-editor, .comment-form, [role="searchbox"]';
+
+/**
+ * Overall time budget for one focusChatInput() ladder scan (ms). Bounds the
+ * worst case of tiers x contexts x cdpCallTimeout when a renderer is hung.
+ */
+const FOCUS_LADDER_BUDGET_MS = 15000;
+
+/**
+ * Build the browser-side script that focuses the chat input for a single tier.
+ *
+ * Selectors are embedded with JSON.stringify because they contain double quotes.
+ * The winning element is tagged with data-remoat-chat-input="1" so other
+ * services (e.g. chatSessionService) can avoid colliding with it.
+ */
+export function buildFocusChatInputScript(tier: number): string {
+    const selector = CHAT_INPUT_CANDIDATES[tier];
+    const excludeBroad = tier >= CHAT_INPUT_BROAD_TIER_START ? CHAT_INPUT_EXCLUDE_BROAD : '';
+    const requireSignal = tier === CHAT_INPUT_CANDIDATES.length - 1;
+    return `(() => {
+        const SEL = ${JSON.stringify(selector)};
+        const EX_ALWAYS = ${JSON.stringify(CHAT_INPUT_EXCLUDE_ALWAYS)};
+        const EX_BROAD = ${JSON.stringify(excludeBroad)};
+        const REQUIRE_SIGNAL = ${requireSignal};
+        const visible = (el) => {
+            if (!el) return false;
+            if (el.offsetParent !== null) return true;
+            const style = window.getComputedStyle(el);
+            if (!style) return false;
+            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+            const rect = typeof el.getBoundingClientRect === 'function' ? el.getBoundingClientRect() : null;
+            return !!rect && rect.width > 0 && rect.height > 0;
+        };
+        const matches = Array.from(document.querySelectorAll(SEL)).filter((el) => {
+            if (!visible(el)) return false;
+            if (typeof el.closest !== 'function') return false;
+            if (el.closest(EX_ALWAYS)) return false;
+            if (EX_BROAD && el.closest(EX_BROAD)) return false;
+            const rect = el.getBoundingClientRect();
+            if (!(rect.width > 40 && rect.height > 8)) return false;
+            if (REQUIRE_SIGNAL) {
+                const label = [
+                    el.getAttribute('aria-label') || '',
+                    el.getAttribute('data-placeholder') || '',
+                    el.getAttribute('placeholder') || ''
+                ].join(' ').toLowerCase();
+                if (!/chat|message|ask|plan|prompt/.test(label)) return false;
+            }
+            return true;
+        });
+        const editor = matches[matches.length - 1];
+        if (!editor) return { ok: false, error: 'No editor found' };
+        Array.from(document.querySelectorAll('[data-remoat-chat-input]'))
+            .forEach((el) => el.removeAttribute('data-remoat-chat-input'));
+        editor.setAttribute('data-remoat-chat-input', '1');
+        editor.focus();
+        return { ok: true, tier: ${tier}, selector: SEL };
+    })()`;
+}
+
+/**
+ * Build the browser-side script that scrolls the conversation feed to the
+ * bottom (issue #4).
+ *
+ * Finds the tallest scrollable element inside `#conversation` /
+ * `.antigravity-agent-side-panel` and pins it to its bottom. Without this, a
+ * stale scroll position leaves screenshots and the IDE view showing an old
+ * part of the feed while the agent's newest output renders off-screen below.
+ */
+export function buildScrollFeedToBottomScript(): string {
+    return `(() => {
+        const roots = [
+            document.getElementById('conversation'),
+            document.querySelector('.antigravity-agent-side-panel'),
+        ].filter(Boolean);
+        if (roots.length === 0) return { ok: false, error: 'No conversation root found' };
+        let best = null;
+        for (const root of roots) {
+            const nodes = [root].concat(Array.from(root.querySelectorAll('*')));
+            for (const el of nodes) {
+                if (!(el instanceof HTMLElement)) continue;
+                if (el.scrollHeight <= el.clientHeight + 4) continue;
+                const style = window.getComputedStyle(el);
+                if (!style || !/(auto|scroll|overlay)/.test(style.overflowY)) continue;
+                if (!best || el.scrollHeight > best.scrollHeight) best = el;
+            }
+            // The first root that yields a scrollable feed wins - #conversation
+            // is more specific than the whole side panel.
+            if (best) break;
+        }
+        if (!best) return { ok: false, error: 'No scrollable feed found' };
+        best.scrollTop = best.scrollHeight;
+        return { ok: true };
+    })()`;
+}
+
 /** Antigravity UI DOM selector constants */
 const SELECTORS = {
-    /** Chat input box: textbox excluding xterm */
-    CHAT_INPUT: 'div[role="textbox"]:not(.xterm-helper-textarea)',
     /** Submit button search target tag */
     SUBMIT_BUTTON_CONTAINER: 'button',
     /** Submit icon SVG class candidates */
@@ -127,6 +263,11 @@ export class CdpService extends EventEmitter {
             }
         }
 
+        // NOTE: the 'Antigravity' title check is an INTENTIONAL substring match that
+        // spans both product names - 'Antigravity IDE'.includes('Antigravity') is true,
+        // so v1 and v2 are both covered. Do NOT tighten it to 'Antigravity IDE'; that
+        // would break every v1 user. The primary discriminator is the version-stable,
+        // VS Code-derived url check for 'workbench'.
         let target = allPages.find(t =>
             t.type === 'page' &&
             t.webSocketDebuggerUrl &&
@@ -621,9 +762,16 @@ export class CdpService extends EventEmitter {
             if (process.platform === 'darwin') {
                 // Fall back to open -a on macOS
                 logger.warn(`[CdpService] CLI launch failed, falling back to open -a: ${error?.message || String(error)}`);
-                await this.runCommand('open', ['-a', 'Antigravity', '--args', `--remote-debugging-port=${cdpPort}`, workspacePath]);
+                // App name is passed as a single argv element and MUST NOT be quoted:
+                // runCommand spawns with shell:false on darwin, so "Antigravity IDE"
+                // arrives intact as one argument.
+                await this.runCommand('open', ['-a', getAntigravityMacAppName(), '--args', `--remote-debugging-port=${cdpPort}`, workspacePath]);
             } else {
                 logger.warn(`[CdpService] CLI launch failed: ${error?.message || String(error)}`);
+                logger.warn(
+                    `[CdpService] Resolved Antigravity executable: ${antigravityCli}. Probed candidates: ${getAntigravityCliCandidates().join(', ') || '(none)'}. ` +
+                    `Set ANTIGRAVITY_PATH if your installation lives elsewhere.`,
+                );
                 throw error;
             }
         }
@@ -702,10 +850,17 @@ export class CdpService extends EventEmitter {
     }
 
     private async runCommand(command: string, args: string[]): Promise<void> {
+        // shell:false passes argv straight to CreateProcess, so paths containing
+        // spaces (e.g. "Antigravity IDE.exe", "C:\Users\John Doe\project") need no
+        // quoting. Only .cmd/.bat shims require a shell, and there every token is
+        // quoted explicitly.
+        const useShell = process.platform === 'win32' && /\.(cmd|bat)$/i.test(command);
+        const finalCommand = useShell ? `"${command}"` : command;
+        const finalArgs = useShell ? args.map((a) => `"${a}"`) : args;
         await new Promise<void>((resolve, reject) => {
-            const child = spawn(command, args, {
+            const child = spawn(finalCommand, finalArgs, {
                 stdio: 'ignore',
-                shell: process.platform === 'win32',
+                shell: useShell,
             });
 
             child.once('error', (error) => {
@@ -910,6 +1065,43 @@ export class CdpService extends EventEmitter {
         return false;
     }
 
+    /**
+     * Scroll the Antigravity conversation feed to its bottom (issue #4).
+     *
+     * Best-effort and non-throwing: a stale scroll position is cosmetic, so
+     * failures are logged at debug level and never propagate to callers.
+     *
+     * @param contextId Preferred execution context (e.g. where the composer was
+     *                  found); all contexts are tried when omitted or unknown
+     * @returns true when a scrollable feed was found and pinned to its bottom
+     */
+    async scrollConversationToBottom(contextId?: number): Promise<boolean> {
+        const script = buildScrollFeedToBottomScript();
+        // Preferred context first, then FALL BACK to the rest: the composer's
+        // context usually hosts the feed too, but when it doesn't (e.g. a
+        // broad-tier match in a webview), the other contexts must still be tried.
+        const preferred = contextId !== undefined
+            ? this.contexts.filter(c => c.id === contextId)
+            : [];
+        const targets = [...preferred, ...this.contexts.filter(c => !preferred.includes(c))];
+        for (const ctx of targets) {
+            try {
+                const res = await this.call('Runtime.evaluate', {
+                    expression: script,
+                    returnByValue: true,
+                    contextId: ctx.id,
+                });
+                if (res?.result?.value?.ok) {
+                    return true;
+                }
+            } catch {
+                // Try next context
+            }
+        }
+        logger.debug('[CdpService] scrollConversationToBottom: no scrollable feed found');
+        return false;
+    }
+
     getPrimaryContextId(): number | null {
         // Legacy: cascade-panel context (removed in v1.21.6+; falls through to first context)
         const context = this.contexts.find(c => c.url && c.url.includes('cascade-panel'));
@@ -924,33 +1116,107 @@ export class CdpService extends EventEmitter {
 
     /**
      * Focus the chat input field.
+     *
+     * Iterates TIERS OUTER and execution CONTEXTS INNER: a match from a more
+     * specific tier in any context always beats a broader tier in an earlier
+     * context. Inverting the loops would let a webview/iframe context win with a
+     * low-specificity match, which is exactly what the tier ladder prevents.
      */
-    private async focusChatInput(): Promise<{ ok: boolean; contextId?: number; error?: string }> {
-        const focusScript = `(() => {
-            const editors = Array.from(document.querySelectorAll('${SELECTORS.CHAT_INPUT}'));
-            const visible = editors.filter(el => el.offsetParent !== null);
-            const editor = visible[visible.length - 1];
-            if (!editor) return { ok: false, error: 'No editor found' };
-            editor.focus();
-            return { ok: true };
-        })()`;
-
-        for (const ctx of this.contexts) {
-            try {
-                const res = await this.call('Runtime.evaluate', {
-                    expression: focusScript,
-                    returnByValue: true,
-                    contextId: ctx.id,
-                });
-                if (res?.result?.value?.ok) {
-                    return { ok: true, contextId: ctx.id };
+    private async focusChatInput(startTier = 0): Promise<{ ok: boolean; contextId?: number; tier?: number; selector?: string; error?: string }> {
+        const deadline = Date.now() + FOCUS_LADDER_BUDGET_MS;
+        // A context whose evaluate timed out once will time out for every
+        // remaining tier too — skip it instead of paying cdpCallTimeout again.
+        const hungContexts = new Set<number>();
+        for (let tier = startTier; tier < CHAT_INPUT_CANDIDATES.length; tier++) {
+            // The budget is enforced at tier boundaries ONLY: every tier that
+            // starts gets a full pass over the contexts. Checking inside the
+            // context loop would let a single timed-out evaluate (cdpCallTimeout
+            // can equal or exceed this budget) abort the ladder before the
+            // context that actually holds the composer is ever probed.
+            if (tier > startTier && Date.now() >= deadline) {
+                logger.warn(`[CdpService] Chat input resolution exceeded ${FOCUS_LADDER_BUDGET_MS}ms budget at tier ${tier}`);
+                return { ok: false, error: 'Chat input resolution timed out' };
+            }
+            const script = buildFocusChatInputScript(tier);
+            for (const ctx of this.contexts) {
+                if (hungContexts.has(ctx.id)) continue;
+                try {
+                    const res = await this.call('Runtime.evaluate', {
+                        expression: script,
+                        returnByValue: true,
+                        contextId: ctx.id,
+                    });
+                    const value = res?.result?.value;
+                    if (value?.ok) {
+                        logger.debug(`[CdpService] Chat input matched tier ${tier} (${CHAT_INPUT_CANDIDATES[tier]}) in context ${ctx.id}`);
+                        return { ok: true, contextId: ctx.id, tier, selector: CHAT_INPUT_CANDIDATES[tier] };
+                    }
+                } catch (err) {
+                    if (err instanceof Error && /timeout/i.test(err.message)) {
+                        hungContexts.add(ctx.id);
+                    }
+                    // Try next context
                 }
-            } catch {
-                // Try next context
             }
         }
 
+        logger.warn(`[CdpService] Chat input not found after ${CHAT_INPUT_CANDIDATES.length - startTier} selector tiers across ${this.contexts.length} contexts`);
         return { ok: false, error: 'Chat input field not found' };
+    }
+
+    /**
+     * Focus the chat input and confirm the focus landed somewhere sane.
+     *
+     * When the negative guard rejects a match (e.g. a panel-scoped tier grabbed
+     * a widget the guard recognises as wrong), the ladder RESUMES at the next
+     * tier instead of failing terminally — one false positive at an early tier
+     * must not permanently disable message injection.
+     */
+    private async focusChatInputVerified(): Promise<{ ok: boolean; contextId?: number; tier?: number; selector?: string; error?: string }> {
+        let startTier = 0;
+        let guardRejected = false;
+        while (startTier < CHAT_INPUT_CANDIDATES.length) {
+            const focusResult = await this.focusChatInput(startTier);
+            if (!focusResult.ok) {
+                return guardRejected
+                    ? { ok: false, error: 'Chat input focus verification failed' }
+                    : focusResult;
+            }
+            if (await this.verifyChatInputFocused(focusResult.contextId)) {
+                return focusResult;
+            }
+            guardRejected = true;
+            const rejectedTier = focusResult.tier ?? startTier;
+            logger.warn(`[CdpService] Focus guard rejected tier ${rejectedTier}; resuming ladder at tier ${rejectedTier + 1}`);
+            startTier = rejectedTier + 1;
+        }
+        return { ok: false, error: 'Chat input focus verification failed' };
+    }
+
+    /**
+     * Negative focus guard: reject known-wrong widgets before destructive input.
+     *
+     * Intentionally NOT a positive data-remoat-chat-input check (React re-renders
+     * can drop the attribute). Evaluate failures are treated as a pass so the
+     * guard can never block a legitimate send.
+     */
+    private async verifyChatInputFocused(contextId?: number): Promise<boolean> {
+        const script = `(() => {
+            const a = document.activeElement;
+            if (!a) return false;
+            if (typeof a.closest === 'function' && a.closest('.monaco-editor, .xterm, .native-edit-context, .quick-input-widget, .monaco-inputbox')) return false;
+            return true;
+        })()`;
+        try {
+            const res = await this.call('Runtime.evaluate', {
+                expression: script,
+                returnByValue: true,
+                ...(contextId !== undefined ? { contextId } : {}),
+            });
+            return res?.result?.value !== false;
+        } catch {
+            return true; // never block on a guard failure
+        }
     }
 
     /**
@@ -1150,7 +1416,7 @@ export class CdpService extends EventEmitter {
             throw new Error('Not connected to CDP. Call connect() first.');
         }
 
-        const focusResult = await this.focusChatInput();
+        const focusResult = await this.focusChatInputVerified();
         if (!focusResult.ok) {
             return { ok: false, error: focusResult.error || 'Chat input field not found' };
         }
@@ -1165,6 +1431,11 @@ export class CdpService extends EventEmitter {
         // 2. Send via Enter key
         await this.pressEnterToSend();
 
+        // Follow the feed: pin the conversation to the newly sent turn after the
+        // DOM has had a moment to append it (issue #4). Best-effort.
+        await new Promise(r => setTimeout(r, 300));
+        await this.scrollConversationToBottom(focusResult.contextId);
+
         return { ok: true, method: 'enter', contextId: focusResult.contextId };
     }
 
@@ -1176,7 +1447,7 @@ export class CdpService extends EventEmitter {
             throw new Error('Not connected to CDP. Call connect() first.');
         }
 
-        const focusResult = await this.focusChatInput();
+        const focusResult = await this.focusChatInputVerified();
         if (!focusResult.ok) {
             return { ok: false, error: focusResult.error || 'Chat input field not found' };
         }
@@ -1192,6 +1463,10 @@ export class CdpService extends EventEmitter {
         await this.call('Input.insertText', { text });
         await new Promise(r => setTimeout(r, 200));
         await this.pressEnterToSend();
+
+        // Follow the feed: pin the conversation to the newly sent turn (issue #4).
+        await new Promise(r => setTimeout(r, 300));
+        await this.scrollConversationToBottom(focusResult.contextId);
 
         return { ok: true, method: 'enter', contextId: focusResult.contextId };
     }

@@ -1,7 +1,13 @@
+// Must mock before importing: pathUtils probes the filesystem via fs.existsSync,
+// and these tests assert PLUMBING (what gets spawned) rather than RESOLUTION
+// (which path wins — owned by tests/utils/pathUtils.test.ts). Without the mock
+// the assertions below would depend on whether the CI box has Antigravity
+// installed. The automock makes existsSync return undefined, so the resolver
+// falls back to its historical literals — identical on a Mac dev box and Linux CI.
+jest.mock('fs');
+
 import { CdpService } from '../../src/services/cdpService';
-import * as child_process from 'child_process';
-import { EventEmitter } from 'events';
-import * as pathUtils from '../../src/utils/pathUtils';
+import * as fs from 'fs';
 
 // Mock logger to avoid printing during tests
 jest.mock('../../src/utils/logger', () => ({
@@ -16,6 +22,12 @@ jest.mock('../../src/utils/logger', () => ({
 // Mock child_process for spawn
 jest.mock('child_process');
 
+const mockedFs = fs as jest.Mocked<typeof fs>;
+
+/** Mark exactly the given paths as existing on disk. */
+const existingPaths = (...paths: string[]) =>
+    mockedFs.existsSync.mockImplementation((p) => paths.includes(String(p)));
+
 describe('CdpService - Cross-Platform Workspace Launching', () => {
     let service: CdpService;
     let originalPlatform: NodeJS.Platform;
@@ -23,9 +35,20 @@ describe('CdpService - Cross-Platform Workspace Launching', () => {
     let mockRunCommand: jest.SpyInstance;
     let mockGetJson: jest.SpyInstance;
 
+    /** A fake CDP page that ends the 30s poll loop immediately. */
+    const fakeWorkbenchPage = (title = 'MyProject') => ([{
+        id: 'new-id',
+        type: 'page',
+        title,
+        webSocketDebuggerUrl: 'ws://debug',
+        url: 'file:///workbench',
+    }]);
+
     beforeEach(() => {
         originalPlatform = process.platform;
         originalEnv = { ...process.env };
+        // Nothing installed by default -> the resolver returns its legacy literals.
+        mockedFs.existsSync.mockReturnValue(false);
 
         service = new CdpService({ portsToScan: [9999], maxReconnectAttempts: 0 });
 
@@ -110,6 +133,72 @@ describe('CdpService - Cross-Platform Workspace Launching', () => {
                 ['-a', 'Antigravity', '--args', '--remote-debugging-port=9999', workspacePath]
             );
         });
+
+        it('passes "Antigravity IDE" as a single unquoted argv element when the v2 bundle is installed', async () => {
+            setPlatform('darwin');
+            // v2 ships as app.asar, so Contents/Resources/app/bin/antigravity does
+            // NOT exist — only the bundle does. The CLI launch therefore fails and
+            // `open -a` is the de-facto primary macOS launcher.
+            existingPaths('/Applications/Antigravity IDE.app');
+
+            mockRunCommand
+                .mockRejectedValueOnce(new Error('Command not found'))
+                .mockResolvedValueOnce(undefined);
+
+            mockGetJson
+                .mockRejectedValueOnce(new Error('Initial pre-launch port scan fails'))
+                .mockResolvedValue(fakeWorkbenchPage());
+
+            const workspacePath = '/Users/test/Documents/MyProject';
+            await service.discoverAndConnectForWorkspace(workspacePath);
+
+            expect(mockRunCommand).toHaveBeenNthCalledWith(2,
+                'open',
+                ['-a', 'Antigravity IDE', '--args', '--remote-debugging-port=9999', workspacePath]
+            );
+            const appNameArg = mockRunCommand.mock.calls[1][1][1];
+            expect(appNameArg).toBe('Antigravity IDE');
+            expect(appNameArg).not.toContain('"');
+        });
+
+        it('keeps using "Antigravity" when only the v1 bundle is installed (backward compat)', async () => {
+            setPlatform('darwin');
+            existingPaths('/Applications/Antigravity.app');
+
+            mockRunCommand
+                .mockRejectedValueOnce(new Error('Command not found'))
+                .mockResolvedValueOnce(undefined);
+
+            mockGetJson
+                .mockRejectedValueOnce(new Error('Initial pre-launch port scan fails'))
+                .mockResolvedValue(fakeWorkbenchPage());
+
+            const workspacePath = '/Users/test/Documents/MyProject';
+            await service.discoverAndConnectForWorkspace(workspacePath);
+
+            expect(mockRunCommand).toHaveBeenNthCalledWith(2,
+                'open',
+                ['-a', 'Antigravity', '--args', '--remote-debugging-port=9999', workspacePath]
+            );
+        });
+
+        it('launches the detected v2 macOS CLI when it does exist', async () => {
+            setPlatform('darwin');
+            const v2Cli = '/Applications/Antigravity IDE.app/Contents/Resources/app/bin/antigravity';
+            existingPaths(v2Cli, '/Applications/Antigravity IDE.app');
+
+            mockGetJson
+                .mockRejectedValueOnce(new Error('Initial pre-launch port scan fails'))
+                .mockResolvedValue(fakeWorkbenchPage());
+
+            const workspacePath = '/Users/test/Documents/MyProject';
+            await service.discoverAndConnectForWorkspace(workspacePath);
+
+            expect(mockRunCommand).toHaveBeenCalledWith(
+                v2Cli,
+                ['--remote-debugging-port=9999', '--new-window', workspacePath]
+            );
+        });
     });
 
     describe('launchAndConnectWorkspace (Windows)', () => {
@@ -155,6 +244,44 @@ describe('CdpService - Cross-Platform Workspace Launching', () => {
 
             expect(mockRunCommand).toHaveBeenCalledWith(
                 'Antigravity.exe',
+                ['--remote-debugging-port=9999', '--new-window', workspacePath]
+            );
+        });
+
+        it('launches the v2 executable when an Antigravity IDE install is detected', async () => {
+            setPlatform('win32');
+            process.env.LOCALAPPDATA = 'C:\\Users\\TestUser\\AppData\\Local';
+            const v2Exe = 'C:\\Users\\TestUser\\AppData\\Local\\Programs\\Antigravity IDE\\Antigravity IDE.exe';
+            existingPaths(v2Exe);
+
+            mockGetJson
+                .mockRejectedValueOnce(new Error('Initial pre-launch port scan fails'))
+                .mockResolvedValue(fakeWorkbenchPage('App'));
+
+            const workspacePath = 'C:\\My Projects\\App';
+            await service.discoverAndConnectForWorkspace(workspacePath);
+
+            expect(mockRunCommand).toHaveBeenCalledWith(
+                v2Exe,
+                ['--remote-debugging-port=9999', '--new-window', workspacePath]
+            );
+        });
+
+        it('launches the v1 executable when only an Antigravity install is detected (backward compat)', async () => {
+            setPlatform('win32');
+            process.env.LOCALAPPDATA = 'C:\\Users\\TestUser\\AppData\\Local';
+            const v1Exe = 'C:\\Users\\TestUser\\AppData\\Local\\Programs\\Antigravity\\Antigravity.exe';
+            existingPaths(v1Exe);
+
+            mockGetJson
+                .mockRejectedValueOnce(new Error('Initial pre-launch port scan fails'))
+                .mockResolvedValue(fakeWorkbenchPage());
+
+            const workspacePath = 'C:\\Source\\MyProject';
+            await service.discoverAndConnectForWorkspace(workspacePath);
+
+            expect(mockRunCommand).toHaveBeenCalledWith(
+                v1Exe,
                 ['--remote-debugging-port=9999', '--new-window', workspacePath]
             );
         });

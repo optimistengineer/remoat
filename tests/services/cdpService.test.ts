@@ -121,3 +121,73 @@ describe('CdpService - Target Detection & Connection', () => {
         expect(service.isConnected()).toBe(false);
     });
 });
+
+/**
+ * Antigravity IDE v2 renamed the Windows executable and install folder, which
+ * also changes the window (and therefore CDP target) title to
+ * "MyProject — Antigravity IDE".
+ *
+ * The target filter deliberately uses `title.includes('Antigravity')`, which
+ * matches BOTH product names. This suite locks that in: narrowing the matcher
+ * to 'Antigravity IDE' would break every v1 user.
+ */
+describe('CdpService - Antigravity IDE v2 target titles', () => {
+    let service: CdpService;
+    let mockHttpServer: http.Server;
+    let mockWss: WebSocketServer;
+    const testPort = 19232;
+    const fakeWsUrl = `ws://127.0.0.1:${testPort}/devtools/page/v2-id`;
+
+    beforeAll((done) => {
+        mockHttpServer = http.createServer((req, res) => {
+            if (req.url === '/json/list') {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify([
+                    {
+                        type: 'page',
+                        title: 'Launchpad — Antigravity IDE',
+                        url: 'file:///some/path/launchpad.html',
+                        webSocketDebuggerUrl: `ws://127.0.0.1:${testPort}/devtools/page/launchpad-id`,
+                    },
+                    {
+                        type: 'page',
+                        title: 'MyProject — Antigravity IDE',
+                        url: 'file:///some/path/workbench.html',
+                        webSocketDebuggerUrl: fakeWsUrl,
+                    },
+                ]));
+            } else {
+                res.writeHead(404);
+                res.end();
+            }
+        });
+
+        mockWss = new WebSocketServer({ server: mockHttpServer });
+        mockHttpServer.listen(testPort, done);
+    });
+
+    afterAll((done) => {
+        mockWss.close(() => {
+            mockHttpServer.close(done);
+        });
+    });
+
+    beforeEach(() => {
+        service = new CdpService({ portsToScan: [testPort], maxReconnectAttempts: 0 });
+    });
+
+    afterEach(async () => {
+        await service.disconnect();
+    });
+
+    it('still selects the workbench target when the title carries the v2 product name', async () => {
+        const targetUrl = await service.discoverTarget();
+        expect(targetUrl).toBe(fakeWsUrl);
+    });
+
+    it('extracts the workspace name from a v2 title without being confused by the extra word', async () => {
+        await service.discoverTarget();
+        // The /\s[—–-]\s/ split must yield "MyProject", not "MyProject — Antigravity".
+        expect(service.getCurrentWorkspaceName()).toBe('MyProject');
+    });
+});

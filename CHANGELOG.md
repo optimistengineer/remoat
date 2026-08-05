@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- Auto-scroll the Antigravity conversation feed to its bottom after sending a prompt and before `/screenshot` captures, so the IDE view and screenshots always show the latest agent output ([#4](https://github.com/optimistengineer/remoat/issues/4))
+
+### Fixed
+- Support Antigravity IDE v2 — existence-based executable/app-bundle resolution with v1 fallback, ordered chat-input selector ladder covering the new `role="combobox"` composer, and correct handling of install paths containing spaces on Windows ([#15](https://github.com/optimistengineer/remoat/issues/15))
+
 ## [0.2.14] - 2026-04-03
 
 ### Fixed

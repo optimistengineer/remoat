@@ -16,11 +16,27 @@ Antigravity must be running with the CDP port enabled:
 open -a Antigravity --args --remote-debugging-port=9223
 ```
 
+Which name to use depends on your install (for a bundle name containing a space,
+the quotes are **mandatory** — this is a shell command, and without them `open`
+would treat `IDE` as a separate argument):
+
+| Install | Command |
+|---------|---------|
+| Antigravity v1 | `open -a Antigravity --args --remote-debugging-port=9223` |
+| Antigravity IDE v2 on macOS | usually still `open -a Antigravity` — macOS v2 (verified on 2.0.10) does **not** rename the `.app` bundle; the rename is Windows-only |
+| A bundle literally named `Antigravity IDE.app` | `open -a "Antigravity IDE" --args --remote-debugging-port=9223` |
+
+Run `ls -d /Applications/Antigravity*.app` (or `remoat doctor`) if you are unsure which bundle you
+have. On Windows the v2 executable is
+`%LOCALAPPDATA%\Programs\Antigravity IDE\Antigravity IDE.exe`; in PowerShell a quoted first token
+needs the call operator: `& "…\Antigravity IDE.exe" --remote-debugging-port=9223`.
+
 ### Steps
 
 1. Open `chrome://inspect/#devices` in Chrome (or Edge)
 2. Click **Configure** → add `localhost:9223` (if not already listed)
-3. The Antigravity page appears under **Remote Target**
+3. The Antigravity page appears under **Remote Target** — on v2 the title reads
+   `<ProjectName> — Antigravity IDE` (v1: `<ProjectName> — Antigravity`)
 4. Click **inspect** → DevTools opens
 
 You can now use the Elements / Console / Network panels as you would on any web page.

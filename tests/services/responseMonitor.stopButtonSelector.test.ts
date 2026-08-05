@@ -1,3 +1,11 @@
+/**
+ * NOTE: this suite is excluded from the default jest run (see
+ * testPathIgnorePatterns in jest.config.js) and is KNOWN RED when executed
+ * directly: three square-icon/near-input heuristic tests predate the current
+ * tooltip-id + stop-label STOP_BUTTON script and fail against it (verified
+ * pre-existing at the commit this note was added). Update or delete those
+ * cases before relying on this suite as a regression gate.
+ */
 import * as vm from 'vm';
 import { RESPONSE_SELECTORS } from '../../src/services/responseMonitor';
 
@@ -12,25 +20,7 @@ type MockButton = {
     getBoundingClientRect: () => { top?: number; left?: number; width: number; height: number };
 };
 
-type MockInput = {
-    offsetParent: unknown;
-    parentElement: any;
-    getBoundingClientRect: () => { top?: number; left?: number; width: number; height: number };
-};
-
-function createInput(top: number = 400, left: number = 20): MockInput {
-    const container = {
-        parentElement: null,
-        querySelectorAll: () => [],
-    };
-    return {
-        offsetParent: {},
-        parentElement: container,
-        getBoundingClientRect: () => ({ top, left, width: 320, height: 120 }),
-    };
-}
-
-function createScope(button: MockButton, extraControls: MockButton[] = [], inputs: MockInput[] = []) {
+function createScope(button: MockButton, extraControls: MockButton[] = []) {
     const controls = [button, ...extraControls];
     return {
         querySelector: (selector: string) => {
@@ -49,9 +39,6 @@ function createScope(button: MockButton, extraControls: MockButton[] = [], input
                 selector === 'button, [role="button"], [class*="cursor-pointer"], [tabindex]'
             ) {
                 return controls;
-            }
-            if (selector === 'div[role="textbox"]:not(.xterm-helper-textarea), textarea, [contenteditable="true"]') {
-                return inputs;
             }
             return [];
         },
@@ -205,7 +192,6 @@ describe('ResponseMonitor stop selector robustness', () => {
     });
 
     it('uses a square icon button near the input area for generating detection', () => {
-        const input = createInput();
         const squareButton: MockButton = {
             tagName: 'BUTTON',
             offsetParent: null,
@@ -220,14 +206,13 @@ describe('ResponseMonitor stop selector robustness', () => {
             getBoundingClientRect: () => ({ top: 430, left: 330, width: 36, height: 36 }),
         };
 
-        const panel = createScope(squareButton, [], [input]);
+        const panel = createScope(squareButton);
         const isStopVisible = runStopSelector(panel);
 
         expect(isStopVisible).toBe(true);
     });
 
     it('does not detect an arrow icon button near the input area as generating', () => {
-        const input = createInput();
         const sendButton: MockButton = {
             tagName: 'BUTTON',
             offsetParent: null,
@@ -243,14 +228,13 @@ describe('ResponseMonitor stop selector robustness', () => {
             getBoundingClientRect: () => ({ top: 430, left: 330, width: 36, height: 36 }),
         };
 
-        const panel = createScope(sendButton, [], [input]);
+        const panel = createScope(sendButton);
         const isStopVisible = runStopSelector(panel);
 
         expect(isStopVisible).toBe(false);
     });
 
     it('does not misidentify a microphone button (path+rect SVG) as a stop button', () => {
-        const input = createInput();
         const micButton: MockButton = {
             tagName: 'BUTTON',
             offsetParent: null,
@@ -268,14 +252,13 @@ describe('ResponseMonitor stop selector robustness', () => {
             getBoundingClientRect: () => ({ top: 430, left: 330, width: 36, height: 36 }),
         };
 
-        const panel = createScope(micButton, [], [input]);
+        const panel = createScope(micButton);
         const isStopVisible = runStopSelector(panel);
 
         expect(isStopVisible).toBe(false);
     });
 
     it('does not click a microphone button (path+rect SVG)', () => {
-        const input = createInput();
         const micButton: MockButton = {
             tagName: 'BUTTON',
             offsetParent: null,
@@ -293,7 +276,7 @@ describe('ResponseMonitor stop selector robustness', () => {
             getBoundingClientRect: () => ({ top: 430, left: 330, width: 36, height: 36 }),
         };
 
-        const panel = createScope(micButton, [], [input]);
+        const panel = createScope(micButton);
         const result = runSelectorScript(RESPONSE_SELECTORS.CLICK_STOP_BUTTON, panel) as {
             ok?: boolean;
         };
@@ -303,7 +286,6 @@ describe('ResponseMonitor stop selector robustness', () => {
     });
 
     it('still detects a rect-only SVG (no path) as a stop button', () => {
-        const input = createInput();
         const stopButton: MockButton = {
             tagName: 'BUTTON',
             offsetParent: null,
@@ -321,7 +303,7 @@ describe('ResponseMonitor stop selector robustness', () => {
             getBoundingClientRect: () => ({ top: 430, left: 330, width: 36, height: 36 }),
         };
 
-        const panel = createScope(stopButton, [], [input]);
+        const panel = createScope(stopButton);
         const isStopVisible = runStopSelector(panel);
 
         expect(isStopVisible).toBe(true);
