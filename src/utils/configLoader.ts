@@ -19,6 +19,7 @@ export interface PersistedConfig {
     logLevel?: LogLevel;
     extractionMode?: 'legacy' | 'structured';
     useTopics?: boolean;
+    display?: string;
 }
 
 function getConfigDir(): string {
@@ -80,6 +81,8 @@ function mergeConfig(persisted: PersistedConfig): AppConfig {
         persisted.extractionMode,
     );
 
+    const display = process.env.DISPLAY ?? process.env.REMOAT_DISPLAY ?? persisted.display;
+
     const useTopics = resolveBoolean(
         process.env.USE_TOPICS,
         persisted.useTopics,
@@ -94,6 +97,7 @@ function mergeConfig(persisted: PersistedConfig): AppConfig {
         logLevel,
         extractionMode,
         useTopics,
+        ...(display ? { display } : {}),
     };
 }
 

@@ -11,6 +11,7 @@ export interface AppConfig {
     logLevel: LogLevel;
     extractionMode: ExtractionMode;
     useTopics: boolean;
+    display?: string;
 }
 
 export type ResponseDeliveryMode = 'stream';

@@ -855,7 +855,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
 
     await ensureAntigravityRunning();
 
-    const bridge = initCdpBridge(config.autoApproveFileEdits);
+    const bridge = initCdpBridge(config.autoApproveFileEdits, config.display);
     bridge.botToken = config.telegramBotToken;
 
     const chatSessionService = new ChatSessionService();

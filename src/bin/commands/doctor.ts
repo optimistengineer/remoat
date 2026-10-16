@@ -13,6 +13,7 @@ import {
     getAntigravityCliPath,
 } from '../../utils/pathUtils';
 import { COLORS } from '../../utils/logger';
+import { resolveLinuxDisplay } from '../../utils/displayUtils';
 
 const ok = (msg: string) => console.log(`  ${COLORS.green}[OK]${COLORS.reset} ${msg}`);
 const warn = (msg: string) => console.log(`  ${COLORS.yellow}[--]${COLORS.reset} ${msg}`);
@@ -157,6 +158,26 @@ export async function doctorAction(): Promise<void> {
                 warn('Antigravity.app / "Antigravity IDE.app" not found in /Applications or ~/Applications');
                 hint('Install Antigravity, or set ANTIGRAVITY_PATH in .env');
             }
+        }
+    }
+
+    if (platform === 'linux') {
+        let customDisplay: string | undefined;
+        try {
+            const configPath = ConfigLoader.getConfigFilePath();
+            if (fs.existsSync(configPath)) {
+                const persisted = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+                customDisplay = typeof persisted.display === 'string' ? persisted.display : undefined;
+            }
+        } catch { /* ignore */ }
+
+        const display = resolveLinuxDisplay(customDisplay);
+        if (display) {
+            ok(`Linux DISPLAY: ${display}`);
+        } else {
+            warn('Linux DISPLAY is not set and no active X11 display was detected');
+            hint('Antigravity requires an X11 server or virtual framebuffer (Xvfb) to launch.');
+            hint('Set DISPLAY in your environment or "display" in ~/.remoat/config.json.');
         }
     }
 

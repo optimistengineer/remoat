@@ -185,11 +185,12 @@ export function parseErrorPopupCustomId(customId: string): { action: 'dismiss' |
     return null;
 }
 
-export function initCdpBridge(autoApproveDefault: boolean): CdpBridge {
+export function initCdpBridge(autoApproveDefault: boolean, display?: string): CdpBridge {
     const pool = new CdpConnectionPool({
         cdpCallTimeout: 15000,
         maxReconnectAttempts: 3,
         reconnectDelayMs: 3000,
+        display,
     });
 
     const quota = new QuotaService();

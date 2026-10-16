@@ -3,6 +3,8 @@ import * as os from 'os';
 import { execFile, spawn } from 'child_process';
 import { CDP_PORTS } from '../../utils/cdpPorts';
 import { getAntigravityCliCandidates, getAntigravityCliPath, getAntigravityMacAppName } from '../../utils/pathUtils';
+import { getLinuxDisplayEnv } from '../../utils/displayUtils';
+import { ConfigLoader } from '../../utils/configLoader';
 
 /** Product family name — console prose ONLY. Never derive an executable or macOS app name from this. */
 const APP_DISPLAY_NAME = 'Antigravity';
@@ -114,16 +116,21 @@ function openWindows(port: number): Promise<void> {
     });
 }
 
-function openLinux(port: number): Promise<void> {
+function openLinux(port: number, display?: string): Promise<void> {
     // getAntigravityCliPath() already honours ANTIGRAVITY_PATH, prefers a
     // PATH-resolvable bare name (so PATH order keeps winning), and only then
     // probes the common absolute install locations.
     const executable = getAntigravityCliPath();
+    const env = {
+        ...process.env,
+        ...getLinuxDisplayEnv(display),
+    };
     return new Promise((resolve, reject) => {
         try {
             const child = spawn(executable, [`--remote-debugging-port=${port}`], {
                 detached: true,
                 stdio: 'ignore',
+                env,
             });
             child.unref();
             child.on('error', (err) => {
@@ -161,7 +168,16 @@ export async function openAction(): Promise<void> {
         } else if (platform === 'win32') {
             await openWindows(port);
         } else {
-            await openLinux(port);
+            let customDisplay: string | undefined;
+            if (ConfigLoader.configExists()) {
+                try {
+                    const cfg = ConfigLoader.load();
+                    customDisplay = cfg.display;
+                } catch {
+                    // Ignore config read error in open command
+                }
+            }
+            await openLinux(port, customDisplay);
         }
 
         console.log(`  ${C.green}${APP_DISPLAY_NAME} opened on CDP port ${port}${C.reset}`);

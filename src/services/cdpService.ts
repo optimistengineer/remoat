@@ -1,5 +1,6 @@
 import { logger } from '../utils/logger';
 import { CDP_PORTS } from '../utils/cdpPorts';
+import { getLinuxDisplayEnv } from '../utils/displayUtils';
 import { EventEmitter } from 'events';
 import * as http from 'http';
 import * as net from 'net';
@@ -14,6 +15,8 @@ export interface CdpServiceOptions {
     maxReconnectAttempts?: number;
     /** Delay between reconnect attempts (ms). Default: 2000 */
     reconnectDelayMs?: number;
+    /** X11 DISPLAY override for Linux. If omitted, resolved via DISPLAY / config / auto-detection. */
+    display?: string;
 }
 
 export interface CdpContext {
@@ -195,6 +198,7 @@ const SELECTORS = {
 };
 
 export class CdpService extends EventEmitter {
+    private readonly options: CdpServiceOptions;
     private ports: number[];
     private isConnectedFlag: boolean = false;
     private ws: WebSocket | null = null;
@@ -224,6 +228,7 @@ export class CdpService extends EventEmitter {
 
     constructor(options: CdpServiceOptions = {}) {
         super();
+        this.options = options;
         this.ports = options.portsToScan || [...CDP_PORTS];
         if (options.cdpCallTimeout) this.cdpCallTimeout = options.cdpCallTimeout;
         this.maxReconnectAttempts = options.maxReconnectAttempts ?? 3;
@@ -857,10 +862,15 @@ export class CdpService extends EventEmitter {
         const useShell = process.platform === 'win32' && /\.(cmd|bat)$/i.test(command);
         const finalCommand = useShell ? `"${command}"` : command;
         const finalArgs = useShell ? args.map((a) => `"${a}"`) : args;
+        const spawnEnv: NodeJS.ProcessEnv = {
+            ...process.env,
+            ...getLinuxDisplayEnv(this.options.display),
+        };
         await new Promise<void>((resolve, reject) => {
             const child = spawn(finalCommand, finalArgs, {
                 stdio: 'ignore',
                 shell: useShell,
+                env: spawnEnv,
             });
 
             child.once('error', (error) => {
